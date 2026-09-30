@@ -1,4 +1,9 @@
 
+<a name="unreleased"></a>
+## [Unreleased](https://github.com/J-F-Liu/lopdf/compare/v0.45.0...HEAD)
+* Wipe the file encryption key when an `EncryptionState` (or a clone of it) is dropped
+* Redact the key, the passwords and the password-derived `/O`, `/U`, `/OE`, `/UE` and `/Perms` values from the `Debug` output of `EncryptionState` and `EncryptionVersion`, and so from a decrypted `Document`'s
+
 <a name="v0.45.0"></a>
 ## [v0.45.0](https://github.com/J-F-Liu/lopdf/compare/v0.44.0...v0.45.0) (2026-09-08)
 * Accept 19-byte cross-reference entries when parsing leniently ([#564](https://github.com/J-F-Liu/lopdf/issues/564))
