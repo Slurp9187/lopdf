@@ -5,6 +5,7 @@ use crate::ObjectId;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use md5::{Digest as _, Md5};
 use rand::RngExt as _;
+use zeroize::Zeroizing;
 
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
@@ -43,8 +44,9 @@ impl CryptFilter for IdentityCryptFilter {
 /// Extend the file key with the low-order 3 bytes of the object number and the
 /// low-order 2 bytes of the generation number, which is how every per-object
 /// key is seeded before hashing (Algorithms 1 and 2.B).
-fn key_with_object_number(key: &[u8], obj_id: ObjectId) -> Vec<u8> {
-    let mut builder = Vec::with_capacity(key.len() + 5);
+fn key_with_object_number(key: &[u8], obj_id: ObjectId) -> Zeroizing<Vec<u8>> {
+    // Room for aes128_compute_key's "sAlT" too, so the key never reallocates.
+    let mut builder = Zeroizing::new(Vec::with_capacity(key.len() + 9));
     builder.extend_from_slice(key);
     builder.extend_from_slice(&obj_id.0.to_le_bytes()[..3]);
     builder.extend_from_slice(&obj_id.1.to_le_bytes()[..2]);
