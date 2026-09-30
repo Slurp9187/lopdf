@@ -528,8 +528,8 @@ fn r4_state(params: R4Params<'_>, crypt_filters: Option<CryptFilters>) -> Result
 
     let mut algorithm = r4_algorithm(key_length, version, revision, encrypt_metadata, permissions);
 
-    let owner_password = algorithm.sanitize_password_r4(owner_password)?;
-    let user_password = algorithm.sanitize_password_r4(user_password)?;
+    let owner_password = Zeroizing::new(algorithm.sanitize_password_r4(owner_password)?);
+    let user_password = Zeroizing::new(algorithm.sanitize_password_r4(user_password)?);
 
     algorithm.owner_value = algorithm.compute_hashed_owner_password_r4(Some(&owner_password), &user_password)?;
 
@@ -547,7 +547,7 @@ fn r4_state(params: R4Params<'_>, crypt_filters: Option<CryptFilters>) -> Result
         revision: algorithm.revision,
         key_length: algorithm.length,
         encrypt_metadata: algorithm.encrypt_metadata,
-        file_encryption_key: Zeroizing::new(file_encryption_key),
+        file_encryption_key,
         crypt_filters,
         stream_filter,
         string_filter,
@@ -604,8 +604,8 @@ fn aes256_state(revision: i64, params: Aes256Params<'_>) -> Result<EncryptionSta
         ..Default::default()
     };
 
-    let owner_password = algorithm.sanitize_password_r6(owner_password)?;
-    let user_password = algorithm.sanitize_password_r6(user_password)?;
+    let owner_password = Zeroizing::new(algorithm.sanitize_password_r6(owner_password)?);
+    let user_password = Zeroizing::new(algorithm.sanitize_password_r6(user_password)?);
 
     let (user_value, user_encrypted) = algorithm.compute_hashed_user_password_r6(file_encryption_key, user_password)?;
 
@@ -728,7 +728,7 @@ impl EncryptionState {
         // Either password may be given, but only the user password (or, for an owner password,
         // the value Algorithm 7 recovers from `/O`) is valid input to Algorithm 2.
         // See `PasswordAlgorithm::resolve_password_for_key_derivation`.
-        let resolved_password = algorithm.resolve_password_for_key_derivation(document, password)?;
+        let resolved_password = Zeroizing::new(algorithm.resolve_password_for_key_derivation(document, password)?);
         let file_encryption_key = algorithm.compute_file_encryption_key(document, resolved_password)?;
 
         let mut crypt_filters = document.get_crypt_filters();
@@ -930,7 +930,7 @@ fn transform_object(
 
     // Compute the key from the original file encryption key and the object identifier to use for
     // the corresponding object.
-    let key = crypt_filter.compute_key(&state.file_encryption_key, obj_id)?;
+    let key = Zeroizing::new(crypt_filter.compute_key(&state.file_encryption_key, obj_id)?);
 
     let transformed = match direction {
         Direction::Encrypt => crypt_filter.encrypt(&key, payload)?,

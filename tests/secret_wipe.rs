@@ -147,3 +147,25 @@ fn a_decrypted_document_wipes_its_key_when_it_drops() {
     let key = state.file_encryption_key().as_ptr();
     assert_wiped_when(key, "the document's key", || drop(doc));
 }
+
+/// The password handed to a loader is wiped once the reader is done with it,
+/// whether it opened the document or not.
+#[cfg(not(feature = "async"))]
+#[test]
+fn the_reader_wipes_the_password_it_was_given() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut doc = document();
+    doc.encrypt(&v5_state()).unwrap();
+    let mut pdf = Vec::new();
+    doc.save_to(&mut pdf).unwrap();
+
+    for (password, opens) in [("user-secret", true), ("wrong-secret", false)] {
+        let options = lopdf::LoadOptions::with_password(password);
+        let buffer = options.password.as_ref().unwrap().as_ptr();
+        let mut result = None;
+        assert_wiped_when(buffer, "the reader's password", || {
+            result = Some(Document::load_mem_with_options(&pdf, options));
+        });
+        assert_eq!(result.unwrap().is_ok(), opens, "{password}");
+    }
+}

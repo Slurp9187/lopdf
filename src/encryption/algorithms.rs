@@ -7,6 +7,8 @@ use aes::cipher::{BlockModeDecrypt as _, BlockModeEncrypt as _, KeyInit as _, Ke
 use md5::{Digest as _, Md5};
 use rand::RngExt as _;
 use sha2::{Sha256, Sha384, Sha512};
+use std::borrow::Cow;
+use zeroize::{Zeroize as _, Zeroizing};
 
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
@@ -26,12 +28,15 @@ fn aes_block_mut(block: &mut [u8]) -> &mut AesBlock {
 /// user password from `/O`; RC4 is symmetric, so the only difference is which
 /// way the counter runs.
 fn rc4_rounds(mut data: Vec<u8>, file_key: &[u8], rounds: impl IntoIterator<Item = u8>) -> Vec<u8> {
-    let mut key = vec![0u8; file_key.len()];
+    let mut key = Zeroizing::new(vec![0u8; file_key.len()]);
     for i in rounds {
         for (in_byte, out_byte) in file_key.iter().zip(key.iter_mut()) {
             *out_byte = in_byte ^ i;
         }
-        data = Rc4::new(&key).encrypt(&data);
+        let next = Rc4::new(&key).encrypt(&data);
+        // When recovering a user password, every intermediate value is secret.
+        data.zeroize();
+        data = next;
     }
     data
 }
@@ -137,7 +142,7 @@ fn md5_key_length(algorithm: &PasswordAlgorithm) -> Result<usize, DecryptionErro
 /// times for revision 3 and above, where `n` is [`md5_key_length`]. This is the
 /// step shared by Algorithms 2, 3 and 7, which differ only in what they feed
 /// the resulting key to.
-fn hash_padded_password(algorithm: &PasswordAlgorithm, password: &[u8]) -> Result<Vec<u8>, DecryptionError> {
+fn hash_padded_password(algorithm: &PasswordAlgorithm, password: &[u8]) -> Result<Zeroizing<Vec<u8>>, DecryptionError> {
     let mut hasher = Md5::new();
     hasher.update(padded_password(password));
 
@@ -153,7 +158,7 @@ fn hash_padded_password(algorithm: &PasswordAlgorithm, password: &[u8]) -> Resul
 
     let n = md5_key_length(algorithm)?;
 
-    Ok(hash[..n].to_vec())
+    Ok(Zeroizing::new(hash[..n].to_vec()))
 }
 
 /// Normalize an `/O` or `/U` value in place against the document's revision: 32
@@ -394,7 +399,7 @@ impl PasswordAlgorithm {
     /// This algorithm is deprecated in PDF 2.0.
     pub(crate) fn compute_file_encryption_key_r4<P>(
         &self, doc: &Document, password: P,
-    ) -> Result<Vec<u8>, DecryptionError>
+    ) -> Result<Zeroizing<Vec<u8>>, DecryptionError>
     where
         P: AsRef<[u8]>,
     {
@@ -435,7 +440,7 @@ impl PasswordAlgorithm {
         }
 
         // The key is the first n bytes of the final digest (n = 5 for R2, else /Length / 8).
-        Ok(hash[..n].to_vec())
+        Ok(Zeroizing::new(hash[..n].to_vec()))
     }
 
     /// Sanitize the password (revision 6 and later).
@@ -443,14 +448,19 @@ impl PasswordAlgorithm {
     /// This implements the first step of Algorithm 2.A as described in ISO 32000-2:2020 (PDF 2.0).
     pub(crate) fn sanitize_password_r6(&self, password: &str) -> Result<Vec<u8>, DecryptionError> {
         // Normalize the password with SASLprep (RFC 4013) and return its UTF-8 bytes.
-        Ok(stringprep::saslprep(password)?.as_bytes().to_vec())
+        let prepared = stringprep::saslprep(password)?;
+        let bytes = prepared.as_bytes().to_vec();
+        if let Cow::Owned(mut prepared) = prepared {
+            prepared.zeroize();
+        }
+        Ok(bytes)
     }
 
     /// Compute a file encryption key in order to encrypt/decrypt a document (revision 6 and
     /// later).
     ///
     /// This implements Algorithm 2.A as described in ISO 32000-2:2020 (PDF 2.0).
-    fn compute_file_encryption_key_r6<P>(&self, password: P) -> Result<Vec<u8>, DecryptionError>
+    fn compute_file_encryption_key_r6<P>(&self, password: P) -> Result<Zeroizing<Vec<u8>>, DecryptionError>
     where
         P: AsRef<[u8]>,
     {
@@ -466,12 +476,12 @@ impl PasswordAlgorithm {
 
         // Algorithm 2.B over password + owner validation salt + U; a match with O means the
         // owner password.
-        if self.compute_hash(password, owner_validation_salt, Some(&self.user_value))? == hashed_owner_password {
+        if *self.compute_hash(password, owner_validation_salt, Some(&self.user_value))? == hashed_owner_password {
             // Algorithm 2.B over password + owner key salt + U gives the key for /OE.
             let key = aes256_key(&self.compute_hash(password, owner_key_salt, Some(&self.user_value))?);
 
             // Decrypt /OE with AES-256 CBC, zero IV, no padding: the result is the file key.
-            let mut owner_encrypted = self.owner_encrypted.clone();
+            let mut owner_encrypted = Zeroizing::new(self.owner_encrypted.clone());
             aes256_cbc(&mut owner_encrypted, key, false);
 
             return Ok(owner_encrypted);
@@ -479,12 +489,12 @@ impl PasswordAlgorithm {
 
         // Not in the spec, but a precaution: 2.B over password + user validation salt;
         // a match with U means the user password.
-        if self.compute_hash(password, user_validation_salt, None)? == hashed_user_password {
+        if *self.compute_hash(password, user_validation_salt, None)? == hashed_user_password {
             // Algorithm 2.B over password + user key salt gives the key for /UE.
             let key = aes256_key(&self.compute_hash(password, user_key_salt, None)?);
 
             // Decrypt /UE with AES-256 CBC, zero IV, no padding: the result is the file key.
-            let mut user_encrypted = self.user_encrypted.clone();
+            let mut user_encrypted = Zeroizing::new(self.user_encrypted.clone());
             aes256_cbc(&mut user_encrypted, key, false);
 
             // Algorithm 13: /Perms must decrypt to "adb" at bytes 9-11 with permissions equal to P.
@@ -499,7 +509,9 @@ impl PasswordAlgorithm {
     /// Compute a hash (revision 6 and later).
     ///
     /// This implements Algorithm 2.B as described in ISO 32000-2:2020 (PDF 2.0).
-    fn compute_hash<P, S>(&self, password: P, salt: S, user_key: Option<&[u8]>) -> Result<Vec<u8>, DecryptionError>
+    fn compute_hash<P, S>(
+        &self, password: P, salt: S, user_key: Option<&[u8]>,
+    ) -> Result<Zeroizing<Vec<u8>>, DecryptionError>
     where
         P: AsRef<[u8]>,
         S: AsRef<[u8]>,
@@ -518,7 +530,7 @@ impl PasswordAlgorithm {
             hasher.update(user_key);
         }
 
-        let mut k = hasher.finalize().to_vec();
+        let mut k = Zeroizing::new(hasher.finalize().to_vec());
 
         // Revision 5 uses a simplified hash algorithm that simply calculates the SHA-256 hash of
         // the original input to the algorithm.
@@ -526,8 +538,11 @@ impl PasswordAlgorithm {
             return Ok(k);
         }
 
-        let mut k1 =
-            Vec::with_capacity(64 * (password.len() + 64 + user_key.map(|user_key| user_key.len()).unwrap_or(0)));
+        // K1 holds 64 copies of the password, so it is wiped on drop. The capacity is exact, so
+        // it never reallocates and leaves no unwiped copy behind.
+        let mut k1 = Zeroizing::new(Vec::with_capacity(
+            64 * (password.len() + 64 + user_key.map(|user_key| user_key.len()).unwrap_or(0)),
+        ));
 
         // Perform the following steps at least 64 times, until the value of the last byte in K is
         // less than or equal to (round number) - 32.
@@ -559,12 +574,12 @@ impl PasswordAlgorithm {
             let e = k1;
 
             // Pick the next hash (SHA-256/384/256) by E[0..16] mod 3; it becomes the new K.
-            k = match e[..16].iter().map(|v| *v as u32).sum::<u32>() % 3 {
-                0 => Sha256::digest(&e).to_vec(),
-                1 => Sha384::digest(&e).to_vec(),
-                2 => Sha512::digest(&e).to_vec(),
+            k = Zeroizing::new(match e[..16].iter().map(|v| *v as u32).sum::<u32>() % 3 {
+                0 => Sha256::digest(&*e).to_vec(),
+                1 => Sha384::digest(&*e).to_vec(),
+                2 => Sha512::digest(&*e).to_vec(),
                 _ => unreachable!(),
-            };
+            });
 
             // Repeat the round while E's last byte is greater than round - 32.
             if round >= 64 && e.last().copied().unwrap_or(0) as u32 <= round - 32 {
@@ -747,7 +762,7 @@ impl PasswordAlgorithm {
     /// [`crate::encryption::PasswordAlgorithm::resolve_password_for_key_derivation`].
     pub(crate) fn recover_user_password_r4<O>(
         &self, doc: &Document, owner_password: O,
-    ) -> Result<Vec<u8>, DecryptionError>
+    ) -> Result<Zeroizing<Vec<u8>>, DecryptionError>
     where
         O: AsRef<[u8]>,
     {
@@ -755,17 +770,17 @@ impl PasswordAlgorithm {
 
         // Decrypt the value of the encryption dictionary's O entry, using an RC4 encryption function
         // with the file encryption key to retrieve the user password.
-        let mut result = self.owner_value.to_vec();
+        let mut result = Zeroizing::new(self.owner_value.to_vec());
 
         // Revision 3+: 19 RC4 rounds, each key being the file key XORed with the counter byte
         // (19 down to 1). RC4 is symmetric, so decrypting is the same round
         // function run in the opposite order.
         if self.revision >= 3 {
-            result = rc4_rounds(result, &hash, (1..=19).rev());
+            result = Zeroizing::new(rc4_rounds(std::mem::take(&mut *result), &hash, (1..=19).rev()));
         }
 
         // Decrypt /O with RC4 using the file encryption key.
-        result = Rc4::new(&hash).decrypt(&result);
+        result = Zeroizing::new(Rc4::new(&hash).decrypt(&*result));
 
         // The result purports to be the user password: authenticate it with Algorithm 5, then feed
         // it to Algorithm 2 to derive the file key.
@@ -899,7 +914,7 @@ impl PasswordAlgorithm {
     ) -> Result<(), DecryptionError> {
         let hash = self.compute_hash(truncate_password(password), &value[32..][..8], user_key)?;
 
-        if hash != value[..32] {
+        if *hash != value[..32] {
             return Err(DecryptionError::IncorrectPassword);
         }
 
@@ -955,11 +970,13 @@ impl PasswordAlgorithm {
     where
         P: AsRef<[u8]>,
     {
-        match self.revision {
-            2..=4 => self.compute_file_encryption_key_r4(doc, password),
-            5..=6 => self.compute_file_encryption_key_r6(password),
-            _ => Err(DecryptionError::UnsupportedRevision),
-        }
+        let mut key = match self.revision {
+            2..=4 => self.compute_file_encryption_key_r4(doc, password)?,
+            5..=6 => self.compute_file_encryption_key_r6(password)?,
+            _ => return Err(DecryptionError::UnsupportedRevision),
+        };
+        // Hand the buffer itself to the caller, leaving no copy behind.
+        Ok(std::mem::take(&mut *key))
     }
 
     /// Resolve a caller-supplied password to the bytes that must actually be
@@ -994,7 +1011,8 @@ impl PasswordAlgorithm {
                 if self.authenticate_user_password_r4(doc, password).is_ok() {
                     Ok(password.to_vec())
                 } else {
-                    self.recover_user_password_r4(doc, password)
+                    let mut recovered = self.recover_user_password_r4(doc, password)?;
+                    Ok(std::mem::take(&mut *recovered))
                 }
             }
             5..=6 => Ok(password.to_vec()),
@@ -1253,7 +1271,7 @@ mod tests {
             // Assert that the file encryption key is equal for both passwords.
             for password in [&owner_password, &user_password] {
                 let key = algorithm.compute_file_encryption_key_r6(password).unwrap();
-                assert_eq!(&file_encryption_key[..], key, "revision {revision}");
+                assert_eq!(&file_encryption_key[..], &key[..], "revision {revision}");
             }
         }
     }
