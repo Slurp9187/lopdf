@@ -8,7 +8,7 @@ use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use std::io::Write;
 
-use lopdf::{DecompressError, Dictionary, Document, Error, LoadOptions, Object, ObjectId, ObjectStream, Stream};
+use lopdf::{DecompressError, Dictionary, Document, Error, LoadOptions, Object, ObjectId, ObjectStream, Stream, dictionary};
 
 const MIB: usize = 1024 * 1024;
 
@@ -307,5 +307,43 @@ fn object_stream_bomb_is_rejected_with_limit() {
         }
         Err(other) => panic!("expected MemoryLimitExceeded, got {other:?}"),
         Ok(_) => panic!("object stream bomb was not caught"),
+    }
+}
+
+/// A lenient load never skips an object stream the decompression limit stops: it
+/// fails, so a capped stream's objects cannot vanish from a document the caller
+/// then trusts. Measured before the fix: the load succeeded without them.
+#[test]
+fn lenient_load_fails_on_a_capped_object_stream() {
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => Object::Reference(pages_id),
+    });
+    for i in 0..200 {
+        doc.add_object(dictionary! { "Note" => Object::Integer(i) });
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(pages_id),
+    });
+    doc.trailer.set("Root", Object::Reference(catalog));
+    let mut pdf = Vec::new();
+    doc.save_modern(&mut pdf).expect("save with object streams");
+
+    assert!(Document::load_mem_with_options(&pdf, LoadOptions::default()).is_ok());
+    match Document::load_mem_with_options(&pdf, LoadOptions::with_max_decompressed_size(256)) {
+        Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => assert_eq!(limit, 256),
+        Err(other) => panic!("expected MemoryLimitExceeded, got {other:?}"),
+        Ok(_) => panic!("the capped object stream was skipped, not refused"),
     }
 }
