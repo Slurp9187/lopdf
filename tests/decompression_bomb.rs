@@ -8,7 +8,9 @@ use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use std::io::Write;
 
-use lopdf::{DecompressError, Dictionary, Document, Error, LoadOptions, Object, ObjectId, ObjectStream, Stream, dictionary};
+use lopdf::{
+    DecompressError, Dictionary, Document, Error, LoadOptions, Object, ObjectId, ObjectStream, Stream, dictionary,
+};
 
 const MIB: usize = 1024 * 1024;
 
@@ -313,8 +315,7 @@ fn object_stream_bomb_is_rejected_with_limit() {
 /// A lenient load never skips an object stream the decompression limit stops: it
 /// fails, so a capped stream's objects cannot vanish from a document the caller
 /// then trusts. Measured before the fix: the load succeeded without them.
-#[test]
-fn lenient_load_fails_on_a_capped_object_stream() {
+fn pdf_with_object_streams() -> Vec<u8> {
     let mut doc = Document::with_version("1.7");
     let pages_id = doc.new_object_id();
     let page_id = doc.add_object(dictionary! {
@@ -339,11 +340,33 @@ fn lenient_load_fails_on_a_capped_object_stream() {
     doc.trailer.set("Root", Object::Reference(catalog));
     let mut pdf = Vec::new();
     doc.save_modern(&mut pdf).expect("save with object streams");
+    pdf
+}
 
+#[test]
+fn lenient_load_fails_on_a_capped_object_stream() {
+    let pdf = pdf_with_object_streams();
     assert!(Document::load_mem_with_options(&pdf, LoadOptions::default()).is_ok());
     match Document::load_mem_with_options(&pdf, LoadOptions::with_max_decompressed_size(256)) {
         Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => assert_eq!(limit, 256),
         Err(other) => panic!("expected MemoryLimitExceeded, got {other:?}"),
         Ok(_) => panic!("the capped object stream was skipped, not refused"),
+    }
+}
+
+/// The total across every stream a load decodes is bounded on its own: each
+/// stream here is under the per-stream limit, and together they are over the
+/// total.
+#[test]
+fn total_decompressed_size_is_bounded_across_streams() {
+    let pdf = pdf_with_object_streams();
+    let mut options = LoadOptions::with_max_decompressed_size(MIB);
+    assert!(Document::load_mem_with_options(&pdf, options).is_ok());
+    options = LoadOptions::with_max_decompressed_size(MIB);
+    options.max_total_decompressed_size = Some(256);
+    match Document::load_mem_with_options(&pdf, options) {
+        Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => assert_eq!(limit, 256),
+        Err(other) => panic!("expected MemoryLimitExceeded, got {other:?}"),
+        Ok(_) => panic!("the total was not bounded"),
     }
 }
