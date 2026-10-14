@@ -839,6 +839,10 @@ impl<'a> Reader<'a> {
                                 }
                             }
                         }
+                        // A decompression limit is the caller's own bound on an
+                        // untrusted file: it is never skipped, or a capped stream's
+                        // objects would vanish from the document unnoticed.
+                        Err(e) if is_decompression_limit(&e) => return Err(e),
                         Err(_e) => {}
                     }
                 }
@@ -920,9 +924,14 @@ impl<'a> Reader<'a> {
                             warn!("Skipping encrypted object at offset {}: {:?}", offset, e);
                             return Ok(None);
                         }
-                        // Lenient loading logs and skips malformed objects; strict loading fails.
+                        // Lenient loading logs and skips malformed objects; strict loading
+                        // fails. A decompression limit is never skipped.
                         error!("Object load error at offset {}: {e:?}", offset);
-                        return if self.strict { Err(e) } else { Ok(None) };
+                        return if self.strict || is_decompression_limit(&e) {
+                            Err(e)
+                        } else {
+                            Ok(None)
+                        };
                     }
                 };
                 if let Some(filter_func) = filter_func
@@ -939,7 +948,13 @@ impl<'a> Reader<'a> {
                             // strict-mode policy as any other load error.
                             Err(e) => {
                                 error!("Object stream load error for {object_id:?}: {e:?}");
-                                return if self.strict { Err(e) } else { Ok(None) };
+                                // A decompression limit fails the load in lenient mode
+                                // too: skipping the stream would drop its objects.
+                                return if self.strict || is_decompression_limit(&e) {
+                                    Err(e)
+                                } else {
+                                    Ok(None)
+                                };
                             }
                         };
                         let container_id = object_id.0;
@@ -2532,4 +2547,12 @@ fn sequential_and_parallel_loads_treat_a_malformed_object_alike() {
         assert_eq!(sequential.objects.len(), intact.objects.len() - 1);
         assert_same_document(&sequential, &parallel);
     }
+}
+
+/// Whether `e` is a decompression limit the caller set
+/// (`LoadOptions::max_decompressed_size`). Such an error always fails a load,
+/// lenient or strict: it is the caller's bound on an untrusted file, not a
+/// malformed object to skip.
+fn is_decompression_limit(e: &Error) -> bool {
+    matches!(e, Error::Decompress(crate::DecompressError::MemoryLimitExceeded { .. }))
 }
