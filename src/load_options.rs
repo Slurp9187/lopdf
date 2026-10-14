@@ -49,6 +49,14 @@ pub struct LoadOptions {
     ///
     /// `None` (the default) applies no limit.
     pub max_decompressed_size: Option<usize>,
+    /// Maximum number of bytes all the streams decoded during loading may
+    /// decompress to together (object streams and cross-reference streams).
+    ///
+    /// [`Self::max_decompressed_size`] bounds one stream; a file can hold many,
+    /// each just under it. Set this to bound the total; going past it fails the
+    /// load with [`crate::DecompressError::MemoryLimitExceeded`] naming this
+    /// limit. `None` (the default) applies no total.
+    pub max_total_decompressed_size: Option<usize>,
 }
 
 impl std::fmt::Debug for LoadOptions {
@@ -58,6 +66,7 @@ impl std::fmt::Debug for LoadOptions {
             .field("filter", &self.filter.map(|_| "fn(..)"))
             .field("strict", &self.strict)
             .field("max_decompressed_size", &self.max_decompressed_size)
+            .field("max_total_decompressed_size", &self.max_total_decompressed_size)
             .finish()
     }
 }
