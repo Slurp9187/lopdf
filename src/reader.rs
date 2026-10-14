@@ -7,6 +7,7 @@ use std::fs::File;
 #[cfg(not(feature = "async"))]
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "rayon")]
@@ -351,6 +352,11 @@ pub struct Reader<'a> {
     /// `None` (the default) applies no limit; set it to guard against
     /// decompression bombs. See [`crate::LoadOptions`].
     pub max_decompressed_size: Option<usize>,
+    /// Maximum decompressed size, in bytes, of all the streams decoded during
+    /// loading together. See [`crate::LoadOptions::max_total_decompressed_size`].
+    pub max_total_decompressed_size: Option<usize>,
+    /// What the streams decoded so far came to. Atomic: objects load in parallel.
+    decompressed_total: AtomicUsize,
     /// Sorted unique byte offsets of every `XrefEntry::Normal` entry in the
     /// final cross-reference table. Built once when the table is complete so
     /// object-boundary lookups can binary-search the successor offset instead
@@ -486,6 +492,8 @@ impl<'a> Reader<'a> {
             password: options.password,
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
+            max_total_decompressed_size: options.max_total_decompressed_size,
+            decompressed_total: AtomicUsize::new(0),
             normal_offsets: Vec::new(),
             object_streams: Mutex::default(),
         }
@@ -805,7 +813,7 @@ impl<'a> Reader<'a> {
                 if let Some(container_obj) = self.document.objects.get(&(container_id, 0))
                     && let Ok(stream) = container_obj.as_stream()
                 {
-                    match ObjectStream::new_with_limit(stream, self.max_decompressed_size) {
+                    match self.decode_object_stream(stream) {
                         Ok(object_stream) => {
                             for (obj_num, _index) in objects_in_stream {
                                 let obj_id = (obj_num, 0);
@@ -917,7 +925,7 @@ impl<'a> Reader<'a> {
 
                 if let Ok(stream) = object.as_stream() {
                     if stream.dict.has_type(b"ObjStm") && !is_encrypted {
-                        let obj_stream = match ObjectStream::new_with_limit(stream, self.max_decompressed_size) {
+                        let obj_stream = match self.decode_object_stream(stream) {
                             Ok(obj_stream) => obj_stream,
                             // Not an encryption-related loss, so it obeys the same
                             // strict-mode policy as any other load error.
@@ -1096,7 +1104,7 @@ impl<'a> Reader<'a> {
         }
         let decoded = self
             .get_object((container, 0), already_seen)
-            .and_then(|object| ObjectStream::new_with_limit(object.as_stream()?, self.max_decompressed_size))
+            .and_then(|object| self.decode_object_stream(object.as_stream()?))
             .map(Arc::new);
         if !matches!(decoded, Err(Error::ReferenceCycle(_))) {
             self.object_streams
@@ -2113,4 +2121,39 @@ startxref
 /// malformed object to skip.
 fn is_decompression_limit(e: &Error) -> bool {
     matches!(e, Error::Decompress(crate::DecompressError::MemoryLimitExceeded { .. }))
+}
+
+impl Reader<'_> {
+    /// The limit the next stream may decompress to: the per-stream one, or what
+    /// is left of the total, whichever is smaller.
+    pub(crate) fn stream_limit(&self) -> Option<usize> {
+        let left = self
+            .max_total_decompressed_size
+            .map(|total| total.saturating_sub(self.decompressed_total.load(Ordering::SeqCst)));
+        match (self.max_decompressed_size, left) {
+            (Some(one), Some(left)) => Some(one.min(left)),
+            (one, left) => one.or(left),
+        }
+    }
+
+    /// Count `bytes` a stream decompressed to toward the total, and fail the
+    /// load once the total is past its limit.
+    pub(crate) fn charge_decompressed(&self, bytes: usize) -> Result<()> {
+        let Some(total) = self.max_total_decompressed_size else {
+            return Ok(());
+        };
+        let before = self.decompressed_total.fetch_add(bytes, Ordering::SeqCst);
+        if before.saturating_add(bytes) > total {
+            return Err(crate::DecompressError::MemoryLimitExceeded { limit: total }.into());
+        }
+        Ok(())
+    }
+
+    /// Decode an object stream under [`Self::stream_limit`], counting it toward
+    /// the total.
+    fn decode_object_stream(&self, stream: &crate::Stream) -> Result<ObjectStream> {
+        let (object_stream, decoded) = ObjectStream::decode_with_limit(stream, self.stream_limit())?;
+        self.charge_decompressed(decoded)?;
+        Ok(object_stream)
+    }
 }
