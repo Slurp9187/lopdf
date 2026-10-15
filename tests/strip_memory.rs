@@ -174,6 +174,7 @@ fn assert_flat(version: &str) {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let small = rises(version, 4 * MIB);
     let large = rises(version, 64 * MIB);
+    eprintln!("{version}: peak rise [strip, verify_stripped, inspect] at 4 MiB {small:?}, at 64 MiB {large:?}");
     for (what, (small, large)) in ["strip", "verify_stripped", "inspect"]
         .iter()
         .zip(small.into_iter().zip(large))
@@ -211,6 +212,7 @@ fn stripping_aes_256_does_not_grow_with_the_file() {
 fn stripping_256_mib_stays_under_the_bound() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let [strip_rise, verify_rise, _] = rises("AES-256", 256 * MIB);
+    eprintln!("AES-256 at 256 MiB: strip rose {strip_rise}, verify_stripped {verify_rise}");
     assert!(strip_rise < BOUND, "strip rose {strip_rise} bytes");
     assert!(verify_rise < BOUND, "verify_stripped rose {verify_rise} bytes");
 }
