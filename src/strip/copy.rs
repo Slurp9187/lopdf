@@ -73,6 +73,9 @@ pub(crate) fn inspect<R: Read + Seek>(input: R, password: Option<&str>, caps: &C
     if encrypted {
         match stand_in(&mut source, &index, caps) {
             Ok((stand_in, _)) => {
+                if let Err(Error::NeedsWholeDocument(reason)) = check_embedded_file_filter(&stand_in) {
+                    needs_whole_document.get_or_insert(reason);
+                }
                 if let Some(password) = password {
                     check = if stand_in.authenticate_user_password(password).is_ok() {
                         PasswordCheck::User
@@ -101,11 +104,13 @@ pub(crate) fn inspect<R: Read + Seek>(input: R, password: Option<&str>, caps: &C
     let mut stripper = Stripper::new(source, io::sink(), index, state, caps);
     stripper.encrypted = encrypted;
     let signed = stripper.signed();
+    let usage_rights = stripper.usage_rights();
 
     Ok(Inspection {
         encrypted,
         password: check,
         signed,
+        usage_rights,
         needs_whole_document,
     })
 }
@@ -128,8 +133,9 @@ fn check_containers(index: &Index) -> std::result::Result<HashSet<u32>, StripFal
     Ok(containers)
 }
 
-/// The Strip decrypts embedded files with `/StmF`, so a different `/EFF` is refused rather than
-/// decrypted with the wrong filter. An absent `/StmF` or `/EFF` means `/Identity`.
+/// Embedded files are found only through every file specification, which takes the whole document,
+/// so a file whose `/EFF` differs from `/StmF` goes to the whole-document path, which honors it.
+/// An absent `/StmF` means `/Identity`; an absent `/EFF` means `/StmF`.
 fn check_embedded_file_filter(stand_in: &Document) -> Result<()> {
     let encrypt = stand_in.get_encrypted()?;
     let name = |key: &[u8]| {
@@ -139,7 +145,7 @@ fn check_embedded_file_filter(stand_in: &Document) -> Result<()> {
             .map_or(b"Identity".to_vec(), <[u8]>::to_vec)
     };
     if encrypt.has(b"EFF") && name(b"EFF") != name(b"StmF") {
-        return Err(encryption::DecryptionError::UnsupportedEncryption.into());
+        return Err(fallback(StripFallback::EmbeddedFileFilter));
     }
     Ok(())
 }
@@ -732,6 +738,19 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
             }
         }
         Ok(Signed::No)
+    }
+
+    /// Whether the catalog's `/Perms` holds a usage-rights signature, `/UR3` or the older `/UR`.
+    fn usage_rights(&mut self) -> bool {
+        let perms = (|| {
+            let root = self.index.trailer.get(b"Root")?.clone();
+            let perms = self.resolve(&root)?.as_dict()?.get(b"Perms")?.clone();
+            self.resolve(&perms)
+        })();
+        perms
+            .ok()
+            .and_then(|perms| perms.as_dict().ok().map(|perms| perms.has(b"UR3") || perms.has(b"UR")))
+            .unwrap_or(false)
     }
 
     fn resolve(&mut self, object: &Object) -> Result<Object> {
