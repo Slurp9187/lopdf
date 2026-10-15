@@ -8,6 +8,7 @@ use md5::{Digest as _, Md5};
 use rand::RngExt as _;
 use sha2::{Sha256, Sha384, Sha512};
 use std::borrow::Cow;
+use subtle::ConstantTimeEq as _;
 use zeroize::{Zeroize as _, Zeroizing};
 
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
@@ -146,6 +147,12 @@ fn md5_key_length(algorithm: &PasswordAlgorithm) -> Result<usize, DecryptionErro
     }
 
     Ok(n)
+}
+
+/// Whether `a` equals `b`, in time that depends only on their lengths: a password check that
+/// stops at the first differing byte tells an attacker how much of its hash they have right.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.ct_eq(b).into()
 }
 
 /// The first `n` bytes of the MD5 digest of the padded `password`, rehashed 50
@@ -511,7 +518,10 @@ impl PasswordAlgorithm {
 
         // Algorithm 2.B over password + owner validation salt + U; a match with O means the
         // owner password.
-        if *self.compute_hash(password, owner_validation_salt, Some(&self.user_value))? == hashed_owner_password {
+        if ct_eq(
+            &self.compute_hash(password, owner_validation_salt, Some(&self.user_value))?,
+            hashed_owner_password,
+        ) {
             // Algorithm 2.B over password + owner key salt + U gives the key for /OE.
             let key = aes256_key(&self.compute_hash(password, owner_key_salt, Some(&self.user_value))?);
 
@@ -524,7 +534,10 @@ impl PasswordAlgorithm {
 
         // Not in the spec, but a precaution: 2.B over password + user validation salt;
         // a match with U means the user password.
-        if *self.compute_hash(password, user_validation_salt, None)? == hashed_user_password {
+        if ct_eq(
+            &self.compute_hash(password, user_validation_salt, None)?,
+            hashed_user_password,
+        ) {
             // Algorithm 2.B over password + user key salt gives the key for /UE.
             let key = aes256_key(&self.compute_hash(password, user_key_salt, None)?);
 
@@ -768,7 +781,7 @@ impl PasswordAlgorithm {
             return Err(DecryptionError::InvalidHashLength);
         }
 
-        if hashed_user_password[..len] != self.user_value[..len] {
+        if !ct_eq(&hashed_user_password[..len], &self.user_value[..len]) {
             return Err(DecryptionError::IncorrectPassword);
         }
 
@@ -959,7 +972,7 @@ impl PasswordAlgorithm {
     ) -> Result<(), DecryptionError> {
         let hash = self.compute_hash(truncate_password(password), &value[32..][..8], user_key)?;
 
-        if *hash != value[..32] {
+        if !ct_eq(&hash, &value[..32]) {
             return Err(DecryptionError::IncorrectPassword);
         }
 
@@ -1096,6 +1109,16 @@ mod tests {
     use crate::creator::tests::create_document;
     use crate::encryption::PasswordAlgorithm;
     use rand::RngExt as _;
+
+    #[test]
+    fn ct_eq_compares_whole_slices() {
+        assert!(super::ct_eq(b"same bytes", b"same bytes"));
+        assert!(!super::ct_eq(b"same bytes", b"same bytez"));
+        assert!(!super::ct_eq(b"Same bytes", b"same bytes"));
+        // A prefix is not equal.
+        assert!(!super::ct_eq(b"same", b"same bytes"));
+        assert!(super::ct_eq(b"", b""));
+    }
 
     #[test]
     fn authenticate_password_r2() {
