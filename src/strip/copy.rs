@@ -5,7 +5,7 @@ use super::index::{Index, read_index};
 use super::source::Source;
 use super::{
     Caps, Inspection, PasswordCheck, Signed, StripFallback, StripObserver, StripOptions, StripReport, Unobserved,
-    observe_strings,
+    UsageRights, observe_strings,
 };
 use crate::encryption::stream::{ChunkDecipher, IdentityDecipher, MAX_EXPANSION};
 use crate::encryption::{self, PasswordAlgorithm};
@@ -842,16 +842,26 @@ impl<'o, R: Read + Seek, W: Write> Stripper<'o, R, W> {
     }
 
     /// Whether the catalog's `/Perms` holds a usage-rights signature, `/UR3` or the older `/UR`.
-    fn usage_rights(&mut self) -> bool {
-        let perms = (|| {
-            let root = self.index.trailer.get(b"Root")?.clone();
-            let perms = self.resolve(&root)?.as_dict()?.get(b"Perms")?.clone();
-            self.resolve(&perms)
-        })();
-        perms
-            .ok()
-            .and_then(|perms| perms.as_dict().ok().map(|perms| perms.has(b"UR3") || perms.has(b"UR")))
-            .unwrap_or(false)
+    /// `No` only when the catalog was read and has none: a catalog or `/Perms` that cannot be read
+    /// is `Unknown`, never taken for absent.
+    fn usage_rights(&mut self) -> UsageRights {
+        let Ok(root) = self.index.trailer.get(b"Root").cloned() else {
+            return UsageRights::Unknown;
+        };
+        let Ok(root) = self.resolve(&root) else {
+            return UsageRights::Unknown;
+        };
+        let Ok(root) = root.as_dict() else {
+            return UsageRights::Unknown;
+        };
+        let Ok(perms) = root.get(b"Perms").cloned() else {
+            return UsageRights::No;
+        };
+        match self.resolve(&perms) {
+            Ok(Object::Dictionary(perms)) if perms.has(b"UR3") || perms.has(b"UR") => UsageRights::Yes,
+            Ok(Object::Dictionary(_)) => UsageRights::No,
+            _ => UsageRights::Unknown,
+        }
     }
 
     fn resolve(&mut self, object: &Object) -> Result<Object> {
@@ -1156,17 +1166,23 @@ mod tests {
 
     #[test]
     fn inspect_reads_a_catalog_in_an_object_stream_only_with_the_key() {
-        use crate::strip::{PasswordCheck, Signed};
+        use crate::strip::{PasswordCheck, Signed, UsageRights};
 
         let bytes = object_stream_file();
         let opened = super::inspect(Cursor::new(&bytes), Some("user"), &Caps::default()).unwrap();
         assert_eq!(opened.password, PasswordCheck::User);
         assert_eq!(opened.signed, Signed::No, "the catalog has no /AcroForm");
+        assert_eq!(opened.usage_rights, UsageRights::No, "nor /Perms");
 
         // Without the key the object stream is ciphertext, never read as plaintext.
         let locked = super::inspect(Cursor::new(&bytes), Some("wrong"), &Caps::default()).unwrap();
         assert_eq!(locked.password, PasswordCheck::Wrong);
         assert_eq!(locked.signed, Signed::Unknown);
+        assert_eq!(
+            locked.usage_rights,
+            UsageRights::Unknown,
+            "an unread catalog is never taken for one without"
+        );
     }
 
     /// What an observer saw: each event's name and bytes, a stream's data joined, since the two
