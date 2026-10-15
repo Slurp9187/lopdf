@@ -604,13 +604,20 @@ fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
             |mut xref, ((start, _count), entries)| {
                 let mut skipped = 0usize;
                 for (index, ((offset, generation), is_normal)) in entries.into_iter().enumerate() {
-                    if is_normal && let Ok(generation) = generation.try_into() {
-                        // `start` is untrusted: `start + index` can overflow, and a `start`
-                        // above u32::MAX would truncate into a valid-looking object number.
-                        match start.checked_add(index).and_then(|id| u32::try_from(id).ok()) {
-                            Some(id) => xref.insert(id, XrefEntry::Normal { offset, generation }),
-                            None => skipped += 1,
+                    // Free entries are kept: they hide an older section's entry for the same object.
+                    let entry = if is_normal {
+                        match generation.try_into() {
+                            Ok(generation) => XrefEntry::Normal { offset, generation },
+                            Err(_) => continue,
                         }
+                    } else {
+                        XrefEntry::free(generation)
+                    };
+                    // `start` is untrusted: `start + index` can overflow, and a `start`
+                    // above u32::MAX would truncate into a valid-looking object number.
+                    match start.checked_add(index).and_then(|id| u32::try_from(id).ok()) {
+                        Some(id) => xref.insert(id, entry),
+                        None => skipped += 1,
                     }
                 }
                 if skipped > 0 {
@@ -933,6 +940,11 @@ mod tests {
         s
     }
 
+    /// The in-use entries of `xref`; free entries, object 0 among them, are recorded too.
+    fn normal_entries(xref: &Xref) -> usize {
+        xref.entries.values().filter(|entry| entry.is_normal()).count()
+    }
+
     fn tstrip<O>(r: NomResult<O>) -> Option<O> {
         r.ok().and_then(|(i, o)| if !i.is_empty() { None } else { Some(o) })
     }
@@ -1100,7 +1112,7 @@ startxref
 %%EOF
 ";
         match xref(test_span(input), false) {
-            Ok((_, re)) => assert_eq!(re.entries.len(), 15),
+            Ok((_, re)) => assert_eq!(normal_entries(&re), 15),
             Err(err) => panic!("unexpected {:?}", err),
         }
     }
@@ -1287,7 +1299,7 @@ EI";
         // Some PDF generators emit "xref \n" with a trailing space.
         let input = b"xref \n0 3\n0000000000 65535 f \n0000000017 00000 n \n0000000081 00000 n \ntrailer\n<</Size 3/Root 1 0 R>>\nstartxref\n175\n%%EOF\n";
         match xref(test_span(input), false) {
-            Ok((_, re)) => assert_eq!(re.entries.len(), 2),
+            Ok((_, re)) => assert_eq!(normal_entries(&re), 2),
             Err(err) => panic!("xref with trailing space should parse: {:?}", err),
         }
     }
@@ -1307,7 +1319,7 @@ EI";
             ),
         ] {
             match xref(test_span(input), false) {
-                Ok((_, re)) => assert_eq!(re.entries.len(), 2, "{name} should yield both normal entries"),
+                Ok((_, re)) => assert_eq!(normal_entries(&re), 2, "{name} should yield both normal entries"),
                 Err(err) => panic!("19-byte entries ({name}) should parse when lenient: {err:?}"),
             }
         }
@@ -1320,7 +1332,7 @@ EI";
         let input =
             b"xref\n0 3\n0000000000 65535 f\n0000000017 00000 n\n0000000081 00000 n\ntrailer\n<</Size 3/Root 1 0 R>>\n";
         if let Ok((_, re)) = xref(test_span(input), true) {
-            assert_eq!(re.entries.len(), 0, "strict must not accept 19-byte entries");
+            assert_eq!(normal_entries(&re), 0, "strict must not accept 19-byte entries");
         }
 
         // The 20-byte build of the same document is the control: it must load in both
@@ -1381,7 +1393,7 @@ EI";
         ] {
             for strict in [false, true] {
                 match xref(test_span(input), strict) {
-                    Ok((_, re)) => assert_eq!(re.entries.len(), 2, "{name} (strict={strict}) lost an entry"),
+                    Ok((_, re)) => assert_eq!(normal_entries(&re), 2, "{name} (strict={strict}) lost an entry"),
                     Err(err) => panic!("conforming {name} entries should parse (strict={strict}): {err:?}"),
                 }
             }
@@ -1414,7 +1426,7 @@ EI";
             match xref(test_span(input), strict) {
                 Ok((_, re)) => {
                     assert_eq!(
-                        re.entries.len(),
+                        normal_entries(&re),
                         1,
                         "(strict={strict}) unexpected entries: {:?}",
                         re.entries
