@@ -34,6 +34,59 @@ pub fn strip<R: Read + Seek, W: Write>(input: R, output: W, options: &StripOptio
     copy::strip(input, output, options, &Caps::default())
 }
 
+/// Checks the PDF in `input` before a Strip, or for keeping it encrypted as it is: whether it is
+/// encrypted, what `password` is to it, whether it is signed, and whether the streaming Strip can
+/// take it. Writes nothing and decrypts no stream data, except the one object stream holding the
+/// signature fields, when the catalog or the fields live in one and a password opens the file.
+///
+/// Fails with [`Error::NeedsWholeDocument`](crate::Error::NeedsWholeDocument) only when the
+/// cross-reference data cannot be read at all; anything else it learns up front is
+/// [`Inspection::needs_whole_document`].
+pub fn inspect<R: Read + Seek>(input: R, password: Option<&str>) -> Result<Inspection> {
+    copy::inspect(input, password, &Caps::default())
+}
+
+/// What [`inspect`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Inspection {
+    /// Whether the trailer names an encryption dictionary.
+    pub encrypted: bool,
+    /// What the password given to [`inspect`] is to the file.
+    pub password: PasswordCheck,
+    /// Whether the file holds a signature a Strip would invalidate.
+    pub signed: Signed,
+    /// Why the streaming Strip would need the whole-document path, when that is known up front. A
+    /// [`strip`] can still find a reason later, in a stream it reads.
+    pub needs_whole_document: Option<StripFallback>,
+}
+
+/// What a password is to a file, from [`inspect`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PasswordCheck {
+    /// No password was given, or the file is not encrypted.
+    NotGiven,
+    /// The user password.
+    User,
+    /// The owner password.
+    Owner,
+    /// Neither. A file whose user password is empty still opens without it.
+    Wrong,
+}
+
+/// Whether a file is signed, from [`inspect`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Signed {
+    /// A `/FT /Sig` form field has a `/V`.
+    Yes,
+    /// No form field is a signed signature field. An unsigned signature field is `No`.
+    No,
+    /// The fields could not all be read: treat the file as signed.
+    Unknown,
+}
+
 /// What [`strip`] needs besides the file.
 pub struct StripOptions {
     /// The user or owner password. The empty password is tried first, as a load does.

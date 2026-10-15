@@ -20,11 +20,46 @@ fn whole(bytes: &[u8], password: &str) -> lopdf::Result<Document> {
     Document::load_mem_with_options(bytes, LoadOptions::with_password(password))
 }
 
+/// The objects of a linearized `doc` that describe its layout, which a Strip drops: the
+/// linearization dictionary and the hint streams at the offsets its `/H` gives.
+fn layout_objects(doc: &Document) -> Vec<ObjectId> {
+    let Some((&id, linearized)) = doc
+        .objects
+        .iter()
+        .find(|(_, object)| object.as_dict().is_ok_and(|dict| dict.has(b"Linearized")))
+    else {
+        return Vec::new();
+    };
+    let hints: Vec<i64> = linearized
+        .as_dict()
+        .unwrap()
+        .get(b"H")
+        .and_then(Object::as_array)
+        .map(|hints| {
+            hints
+                .iter()
+                .step_by(2)
+                .filter_map(|offset| offset.as_i64().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut ids = vec![id];
+    for (&number, entry) in &doc.reference_table.entries {
+        if let lopdf::xref::XrefEntry::Normal { offset, generation } = entry
+            && hints.contains(&i64::from(*offset))
+        {
+            ids.push((number, *generation));
+        }
+    }
+    ids
+}
+
 /// Each object a Strip keeps, as text: a stream's content too, which `Debug` leaves out.
 fn objects(doc: &Document) -> BTreeMap<ObjectId, String> {
+    let layout = layout_objects(doc);
     doc.objects
         .iter()
-        .filter(|(_, object)| object.type_name().ok() != Some(b"XRef"))
+        .filter(|(id, object)| object.type_name().ok() != Some(b"XRef") && !layout.contains(id))
         .map(|(id, object)| {
             let text = match object {
                 Object::Stream(stream) => format!("{:?} {:?}", stream.dict, stream.content),

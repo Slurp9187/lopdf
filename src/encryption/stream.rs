@@ -43,7 +43,7 @@ fn check_output(input: &[u8], output: &[u8]) {
 }
 
 /// The Identity crypt filter: the data is not encrypted.
-pub(super) struct IdentityDecipher;
+pub(crate) struct IdentityDecipher;
 
 impl ChunkDecipher for IdentityDecipher {
     fn tail_len(&self) -> usize {
