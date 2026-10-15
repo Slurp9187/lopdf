@@ -7,8 +7,10 @@ use crate::{Dictionary, Document, Error, Object, ObjectId};
 use bitflags::bitflags;
 use crypt_filters::*;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 pub use algorithms::PasswordAlgorithm;
 
@@ -135,7 +137,7 @@ impl Permissions {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum EncryptionVersion<'a> {
     /// (PDF 1.4; deprecated in PDF 2.0) Indicates the use of encryption of data using the RC4 or
     /// AES algorithms with a file encryption key length of 40 bits.
@@ -200,14 +202,19 @@ pub enum EncryptionVersion<'a> {
     },
 }
 
-#[derive(Clone, Debug, Default)]
+/// The state needed to encrypt or decrypt a document's objects.
+///
+/// The file encryption key is wiped when the state (or any clone of it) is dropped, and
+/// `Debug` prints neither the key nor the password-derived `/O`, `/U`, `/OE`, `/UE` and
+/// `/Perms` values.
+#[derive(Clone, Default)]
 pub struct EncryptionState {
     pub(crate) version: i64,
     pub(crate) revision: i64,
     pub(crate) key_length: Option<usize>,
     pub(crate) encrypt_metadata: bool,
     pub(crate) crypt_filters: BTreeMap<Vec<u8>, Arc<dyn CryptFilter>>,
-    pub(crate) file_encryption_key: Vec<u8>,
+    pub(crate) file_encryption_key: Zeroizing<Vec<u8>>,
     pub(crate) stream_filter: Vec<u8>,
     pub(crate) string_filter: Vec<u8>,
     pub(crate) owner_value: Vec<u8>,
@@ -221,6 +228,122 @@ pub struct EncryptionState {
     /// trailer. Used by `IncrementalDocument` to restore the `/Encrypt` reference
     /// in the appended trailer.
     pub(crate) encrypt_object_id: Option<ObjectId>,
+}
+
+/// Stands in for a secret in `Debug` output.
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl fmt::Debug for EncryptionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptionState")
+            .field("version", &self.version)
+            .field("revision", &self.revision)
+            .field("key_length", &self.key_length)
+            .field("encrypt_metadata", &self.encrypt_metadata)
+            .field("crypt_filters", &self.crypt_filters)
+            .field("file_encryption_key", &Redacted)
+            .field("stream_filter", &self.stream_filter)
+            .field("string_filter", &self.string_filter)
+            .field("owner_value", &Redacted)
+            .field("owner_encrypted", &Redacted)
+            .field("user_value", &Redacted)
+            .field("user_encrypted", &Redacted)
+            .field("permissions", &self.permissions)
+            .field("permission_encrypted", &Redacted)
+            .field("encrypt_object_id", &self.encrypt_object_id)
+            .finish()
+    }
+}
+
+impl fmt::Debug for EncryptionVersion<'_> {
+    #[allow(deprecated)]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::V1 {
+                document, permissions, ..
+            } => f
+                .debug_struct("V1")
+                .field("document", document)
+                .field("owner_password", &Redacted)
+                .field("user_password", &Redacted)
+                .field("permissions", permissions)
+                .finish(),
+            Self::V2 {
+                document,
+                key_length,
+                permissions,
+                ..
+            } => f
+                .debug_struct("V2")
+                .field("document", document)
+                .field("owner_password", &Redacted)
+                .field("user_password", &Redacted)
+                .field("key_length", key_length)
+                .field("permissions", permissions)
+                .finish(),
+            Self::V4 {
+                document,
+                encrypt_metadata,
+                crypt_filters,
+                stream_filter,
+                string_filter,
+                permissions,
+                ..
+            } => f
+                .debug_struct("V4")
+                .field("document", document)
+                .field("encrypt_metadata", encrypt_metadata)
+                .field("crypt_filters", crypt_filters)
+                .field("stream_filter", stream_filter)
+                .field("string_filter", string_filter)
+                .field("owner_password", &Redacted)
+                .field("user_password", &Redacted)
+                .field("permissions", permissions)
+                .finish(),
+            Self::R5 {
+                encrypt_metadata,
+                crypt_filters,
+                stream_filter,
+                string_filter,
+                permissions,
+                ..
+            } => f
+                .debug_struct("R5")
+                .field("encrypt_metadata", encrypt_metadata)
+                .field("crypt_filters", crypt_filters)
+                .field("file_encryption_key", &Redacted)
+                .field("stream_filter", stream_filter)
+                .field("string_filter", string_filter)
+                .field("owner_password", &Redacted)
+                .field("user_password", &Redacted)
+                .field("permissions", permissions)
+                .finish(),
+            Self::V5 {
+                encrypt_metadata,
+                crypt_filters,
+                stream_filter,
+                string_filter,
+                permissions,
+                ..
+            } => f
+                .debug_struct("V5")
+                .field("encrypt_metadata", encrypt_metadata)
+                .field("crypt_filters", crypt_filters)
+                .field("file_encryption_key", &Redacted)
+                .field("stream_filter", stream_filter)
+                .field("string_filter", string_filter)
+                .field("owner_password", &Redacted)
+                .field("user_password", &Redacted)
+                .field("permissions", permissions)
+                .finish(),
+        }
+    }
 }
 
 /// Fields shared by the AES-256 variants (`R5` and `V5`), which differ only
@@ -405,8 +528,8 @@ fn r4_state(params: R4Params<'_>, crypt_filters: Option<CryptFilters>) -> Result
 
     let mut algorithm = r4_algorithm(key_length, version, revision, encrypt_metadata, permissions);
 
-    let owner_password = algorithm.sanitize_password_r4(owner_password)?;
-    let user_password = algorithm.sanitize_password_r4(user_password)?;
+    let owner_password = Zeroizing::new(algorithm.sanitize_password_r4(owner_password)?);
+    let user_password = Zeroizing::new(algorithm.sanitize_password_r4(user_password)?);
 
     algorithm.owner_value = algorithm.compute_hashed_owner_password_r4(Some(&owner_password), &user_password)?;
 
@@ -481,8 +604,8 @@ fn aes256_state(revision: i64, params: Aes256Params<'_>) -> Result<EncryptionSta
         ..Default::default()
     };
 
-    let owner_password = algorithm.sanitize_password_r6(owner_password)?;
-    let user_password = algorithm.sanitize_password_r6(user_password)?;
+    let owner_password = Zeroizing::new(algorithm.sanitize_password_r6(owner_password)?);
+    let user_password = Zeroizing::new(algorithm.sanitize_password_r6(user_password)?);
 
     let (user_value, user_encrypted) = algorithm.compute_hashed_user_password_r6(file_encryption_key, user_password)?;
 
@@ -503,7 +626,7 @@ fn aes256_state(revision: i64, params: Aes256Params<'_>) -> Result<EncryptionSta
         key_length: algorithm.length,
         encrypt_metadata: algorithm.encrypt_metadata,
         crypt_filters,
-        file_encryption_key: file_encryption_key.to_vec(),
+        file_encryption_key: Zeroizing::new(file_encryption_key.to_vec()),
         stream_filter,
         string_filter,
         owner_value: algorithm.owner_value,
@@ -538,7 +661,7 @@ impl EncryptionState {
     }
 
     pub fn file_encryption_key(&self) -> &[u8] {
-        self.file_encryption_key.as_ref()
+        self.file_encryption_key.as_slice()
     }
 
     pub fn default_stream_filter(&self) -> &[u8] {
@@ -605,7 +728,7 @@ impl EncryptionState {
         // Either password may be given, but only the user password (or, for an owner password,
         // the value Algorithm 7 recovers from `/O`) is valid input to Algorithm 2.
         // See `PasswordAlgorithm::resolve_password_for_key_derivation`.
-        let resolved_password = algorithm.resolve_password_for_key_derivation(document, password)?;
+        let resolved_password = Zeroizing::new(algorithm.resolve_password_for_key_derivation(document, password)?);
         let file_encryption_key = algorithm.compute_file_encryption_key(document, resolved_password)?;
 
         let mut crypt_filters = document.get_crypt_filters();
@@ -621,7 +744,7 @@ impl EncryptionState {
             key_length: algorithm.length,
             encrypt_metadata: algorithm.encrypt_metadata,
             crypt_filters,
-            file_encryption_key,
+            file_encryption_key: Zeroizing::new(file_encryption_key),
             owner_value: algorithm.owner_value,
             owner_encrypted: algorithm.owner_encrypted,
             user_value: algorithm.user_value,
@@ -807,7 +930,7 @@ fn transform_object(
 
     // Compute the key from the original file encryption key and the object identifier to use for
     // the corresponding object.
-    let key = crypt_filter.compute_key(&state.file_encryption_key, obj_id)?;
+    let key = Zeroizing::new(crypt_filter.compute_key(&state.file_encryption_key, obj_id)?);
 
     let transformed = match direction {
         Direction::Encrypt => crypt_filter.encrypt(&key, payload)?,
@@ -933,6 +1056,69 @@ mod tests {
             let state = EncryptionState::try_from(version).unwrap();
             assert!(document.encrypt(&state).is_ok());
             assert!(document.decrypt("user").is_ok());
+        }
+    }
+
+    /// `Debug` must not print the passwords, the file encryption key or the
+    /// password-derived values, whether through `EncryptionVersion`,
+    /// `EncryptionState` or a decrypted `Document` that holds the state.
+    #[test]
+    fn debug_redacts_keys_and_passwords() {
+        let file_encryption_key = [0xABu8; 32];
+        let key_bytes = "171, 171, 171, 171";
+        let key_hex = ["abababab", "ABABABAB"];
+        let crypt_filter: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
+        let version = EncryptionVersion::V5 {
+            encrypt_metadata: true,
+            crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), crypt_filter)]),
+            file_encryption_key: &file_encryption_key,
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_password: "owner-secret",
+            user_password: "user-secret",
+            permissions: Permissions::all(),
+        };
+
+        assert_eq!(
+            format!("{version:?}"),
+            "V5 { encrypt_metadata: true, \
+             crypt_filters: {[83, 116, 100, 67, 70]: Aes256CryptFilter}, \
+             file_encryption_key: [REDACTED], \
+             stream_filter: [83, 116, 100, 67, 70], \
+             string_filter: [83, 116, 100, 67, 70], \
+             owner_password: [REDACTED], user_password: [REDACTED], \
+             permissions: Permissions(PRINTABLE | MODIFIABLE | COPYABLE | ANNOTABLE | FILLABLE \
+             | COPYABLE_FOR_ACCESSIBILITY | ASSEMBLABLE | PRINTABLE_IN_HIGH_QUALITY) }"
+        );
+
+        let state = EncryptionState::try_from(version).unwrap();
+        let state_debug = format!("{state:?}");
+        for field in [
+            "file_encryption_key",
+            "owner_value",
+            "owner_encrypted",
+            "user_value",
+            "user_encrypted",
+            "permission_encrypted",
+        ] {
+            assert!(state_debug.contains(&format!("{field}: [REDACTED]")), "{state_debug}");
+        }
+
+        let mut document = create_document();
+        document.encrypt(&state).unwrap();
+        document.decrypt("user-secret").unwrap();
+        assert_eq!(
+            document.encryption_state.as_ref().unwrap().file_encryption_key(),
+            file_encryption_key
+        );
+
+        let debugs = [state_debug, format!("{:?}", state.clone()), format!("{document:?}")];
+        for debug in &debugs {
+            assert!(!debug.contains(key_bytes), "{debug}");
+            for hex in key_hex {
+                assert!(!debug.contains(hex), "{debug}");
+            }
+            assert!(!debug.contains("secret"), "{debug}");
         }
     }
 
