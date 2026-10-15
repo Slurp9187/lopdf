@@ -639,10 +639,10 @@ pub fn decode_xref_stream_with_limit(
                 };
                 let entry = match entry_type {
                     0 => {
-                        // free object
+                        // free object, kept so that it hides an older section's entry
                         read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
-                        read_big_endian_integer(&mut reader, bytes3.as_mut_slice())?;
-                        None
+                        let generation = read_big_endian_integer(&mut reader, bytes3.as_mut_slice())?;
+                        Some(XrefEntry::free(generation))
                     }
                     1 => {
                         // normal object
@@ -661,10 +661,11 @@ pub fn decode_xref_stream_with_limit(
                         Some(XrefEntry::Compressed { container, index })
                     }
                     _ => {
-                        // unknown types are null references, but their fields still take up space
+                        // unknown types are references to the null object, which hide an older
+                        // section's entry as a free one does; their fields still take up space
                         read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
                         read_big_endian_integer(&mut reader, bytes3.as_mut_slice())?;
-                        None
+                        Some(XrefEntry::Free)
                     }
                 };
                 // `start` is untrusted, as in a cross-reference table: `start + j` can overflow,
