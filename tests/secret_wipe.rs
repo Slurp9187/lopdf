@@ -23,11 +23,12 @@ const NOT_WIPED: u8 = 2;
 /// The watch is global, so the tests take turns.
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// While set, every freed allocation is searched for `MARKER`, for buffers a test cannot reach.
+/// While set, every freed allocation is searched for either half of `MARKER`, for buffers a test
+/// cannot reach. A half is one AES block, the most a chunk decipher holds.
 static SCANNING: AtomicBool = AtomicBool::new(false);
-/// Whether a freed allocation still held `MARKER` while scanning.
+/// Whether a freed allocation still held half of `MARKER` while scanning.
 static MARKER_FREED: AtomicBool = AtomicBool::new(false);
-/// Plaintext no other allocation in the test binary holds.
+/// Plaintext no other allocation in the test binary holds, in two 16-byte halves.
 const MARKER: &[u8; 32] = b"plaintext marker 7f3a9c1e5b2d804";
 
 unsafe impl GlobalAlloc for WatchingAllocator {
@@ -54,7 +55,10 @@ unsafe impl GlobalAlloc for WatchingAllocator {
         }
         if SCANNING.load(Ordering::SeqCst) {
             let bytes = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
-            if bytes.windows(MARKER.len()).any(|window| window == MARKER) {
+            if MARKER
+                .chunks(16)
+                .any(|half| bytes.windows(half.len()).any(|window| window == half))
+            {
                 MARKER_FREED.store(true, Ordering::SeqCst);
             }
         }
@@ -186,6 +190,66 @@ fn aes_decryption_leaves_no_unwiped_plaintext_behind() {
     });
 }
 
+/// Decrypts `ciphertext` through the AES-256 chunk decipher keyed with `key`, 7 bytes at a time,
+/// into a buffer that is wiped on drop, and drops the decipher.
+fn chunk_decrypt_aes256(key: &[u8], ciphertext: &[u8]) -> zeroize::Zeroizing<Vec<u8>> {
+    use lopdf::encryption::stream::MAX_EXPANSION;
+
+    let mut decipher = Aes256CryptFilter.chunked_decrypt(key).unwrap().unwrap();
+    let mut plaintext = zeroize::Zeroizing::new(Vec::with_capacity(ciphertext.len()));
+    let mut output = zeroize::Zeroizing::new(vec![0u8; 7 + MAX_EXPANSION]);
+    for piece in ciphertext.chunks(7) {
+        let n = decipher.update(piece, &mut output).unwrap();
+        plaintext.extend_from_slice(&output[..n]);
+    }
+    let n = decipher.finish(&mut output).unwrap();
+    plaintext.extend_from_slice(&output[..n]);
+    plaintext
+}
+
+#[test]
+fn a_chunk_decipher_leaves_no_unwiped_plaintext_behind() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let key = [0x5Au8; 32];
+    let ciphertext = Aes256CryptFilter.encrypt(&key, MARKER).unwrap();
+
+    // The decipher holds a decrypted block back until the next one arrives.
+    assert_marker_never_freed("the AES chunk decipher", || {
+        assert_eq!(chunk_decrypt_aes256(&key, &ciphertext).as_slice(), MARKER);
+    });
+}
+
+#[test]
+fn a_chunk_decipher_dropped_part_way_leaves_no_unwiped_plaintext_behind() {
+    use lopdf::encryption::stream::MAX_EXPANSION;
+
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let key = [0x5Au8; 32];
+    let ciphertext = Aes256CryptFilter.encrypt(&key, MARKER).unwrap();
+
+    // A cancelled Strip drops the decipher holding a decrypted block: here the IV and the two
+    // marker blocks have arrived, so the second half of the marker is held back.
+    assert_marker_never_freed("a chunk decipher dropped part way", || {
+        let mut decipher = Aes256CryptFilter.chunked_decrypt(&key).unwrap().unwrap();
+        let mut output = zeroize::Zeroizing::new(vec![0u8; 48 + MAX_EXPANSION]);
+        let n = decipher.update(&ciphertext[..48], &mut output).unwrap();
+        assert_eq!(&output[..n], &MARKER[..16]);
+        drop(decipher);
+    });
+}
+
+#[test]
+fn a_chunk_decipher_leaves_no_unwiped_key_behind() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // The marker is 32 bytes, an AES-256 key: the decipher keeps a copy, and the first round keys
+    // of the cipher's schedule are the key itself.
+    let ciphertext = Aes256CryptFilter.encrypt(MARKER, b"some plaintext").unwrap();
+
+    assert_marker_never_freed("the AES chunk decipher's key", || {
+        assert_eq!(chunk_decrypt_aes256(MARKER, &ciphertext).as_slice(), b"some plaintext");
+    });
+}
+
 #[test]
 fn the_password_algorithms_debug_hides_the_password_values() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -228,4 +292,28 @@ fn the_reader_wipes_the_password_it_was_given() {
         });
         assert_eq!(result.unwrap().is_ok(), opens, "{password}");
     }
+}
+
+#[test]
+fn the_streaming_strip_leaves_no_unwiped_plaintext_behind() {
+    use lopdf::strip::{StripOptions, strip};
+
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // The marker in a string, which the Strip parses into an object, and in stream data, which
+    // goes through its chunk buffers.
+    let mut doc = document();
+    let info_id = doc.add_object(dictionary! { "Title" => Object::string_literal(MARKER.to_vec()) });
+    doc.trailer.set("Info", info_id);
+    doc.add_object(Stream::new(dictionary! {}, MARKER.repeat(3000)));
+    doc.encrypt(&v5_state()).unwrap();
+    let mut pdf = Vec::new();
+    doc.save_to(&mut pdf).unwrap();
+
+    let options = StripOptions::with_password("user-secret");
+    // Reserved up front, so the output never reallocates, and wiped on drop.
+    let mut output = zeroize::Zeroizing::new(Vec::with_capacity(4 * pdf.len()));
+    assert_marker_never_freed("the streaming Strip", || {
+        strip(std::io::Cursor::new(&pdf), &mut *output, &options).unwrap();
+    });
+    assert!(output.windows(MARKER.len()).any(|window| window == MARKER));
 }
