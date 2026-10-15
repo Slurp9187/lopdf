@@ -2,6 +2,7 @@ mod algorithms;
 pub mod crypt_filters;
 mod pkcs5;
 mod rc4;
+pub mod stream;
 
 use crate::{Dictionary, Document, Error, Object, ObjectId, Stream};
 use bitflags::bitflags;
