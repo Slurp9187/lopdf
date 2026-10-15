@@ -783,7 +783,16 @@ fn transform_object(
             return Ok(());
         }
         Object::Dictionary(objects) => {
-            for (_, obj) in objects.iter_mut() {
+            // A signature dictionary's /Contents is not encrypted (ISO 32000-2, 7.6.2): it holds
+            // a signature over the file's bytes as written. /ByteRange marks such a dictionary,
+            // with or without its optional /Type.
+            let is_signature = objects.has(b"ByteRange");
+
+            for (key, obj) in objects.iter_mut() {
+                if is_signature && key.as_slice() == b"Contents" {
+                    continue;
+                }
+
                 transform_object(state, obj_id, obj, direction)?;
             }
 
