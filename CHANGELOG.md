@@ -1,4 +1,8 @@
 
+<a name="unreleased"></a>
+## [Unreleased](https://github.com/J-F-Liu/lopdf/compare/v0.45.0...HEAD)
+* Treat `/Identity` and an absent `/StmF`, `/StrF` or stream `/Crypt` name as the Identity crypt filter from V4 on, instead of RC4; find a stream's `/Crypt` parameters in a `/DecodeParms` array; refuse a crypt filter name that is not in `/CF`. `get_stream_filter` and `get_string_filter` now return a `Result`
+
 <a name="v0.45.0"></a>
 ## [v0.45.0](https://github.com/J-F-Liu/lopdf/compare/v0.44.0...v0.45.0) (2026-09-08)
 * Accept 19-byte cross-reference entries when parsing leniently ([#564](https://github.com/J-F-Liu/lopdf/issues/564))
