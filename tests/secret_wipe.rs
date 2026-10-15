@@ -293,3 +293,27 @@ fn the_reader_wipes_the_password_it_was_given() {
         assert_eq!(result.unwrap().is_ok(), opens, "{password}");
     }
 }
+
+#[test]
+fn the_streaming_strip_leaves_no_unwiped_plaintext_behind() {
+    use lopdf::strip::{StripOptions, strip};
+
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // The marker in a string, which the Strip parses into an object, and in stream data, which
+    // goes through its chunk buffers.
+    let mut doc = document();
+    let info_id = doc.add_object(dictionary! { "Title" => Object::string_literal(MARKER.to_vec()) });
+    doc.trailer.set("Info", info_id);
+    doc.add_object(Stream::new(dictionary! {}, MARKER.repeat(3000)));
+    doc.encrypt(&v5_state()).unwrap();
+    let mut pdf = Vec::new();
+    doc.save_to(&mut pdf).unwrap();
+
+    let options = StripOptions::with_password("user-secret");
+    // Reserved up front, so the output never reallocates, and wiped on drop.
+    let mut output = zeroize::Zeroizing::new(Vec::with_capacity(4 * pdf.len()));
+    assert_marker_never_freed("the streaming Strip", || {
+        strip(std::io::Cursor::new(&pdf), &mut *output, &options).unwrap();
+    });
+    assert!(output.windows(MARKER.len()).any(|window| window == MARKER));
+}
