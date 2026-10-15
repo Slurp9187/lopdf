@@ -1,4 +1,8 @@
 
+<a name="unreleased"></a>
+## [Unreleased](https://github.com/J-F-Liu/lopdf/compare/v0.45.0...HEAD)
+* Fail loading an encrypted document when an object fails to decrypt, such as an AES string whose length is not a multiple of 16, instead of keeping its ciphertext; leave a signature dictionary's `/Contents` unencrypted and undecrypted, as the spec requires
+
 <a name="v0.45.0"></a>
 ## [v0.45.0](https://github.com/J-F-Liu/lopdf/compare/v0.44.0...v0.45.0) (2026-09-08)
 * Accept 19-byte cross-reference entries when parsing leniently ([#564](https://github.com/J-F-Liu/lopdf/issues/564))
