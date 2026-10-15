@@ -1,6 +1,7 @@
 # Streaming Strip: remove a PDF's encryption in bounded memory
 
-Fork-only work, built in pull requests into `main`, the fork's trunk. It is the lopdf part of
+Fork-only work on `topic/stream-strip`, built in pull requests into that branch. It is the lopdf
+part of
 [encrypted-file-vault#1193](https://github.com/Slurp9187/encrypted-file-vault/issues/1193)
 ("Streaming for every encryption format"), adopted on EFV's side as slice A7.
 
@@ -151,8 +152,10 @@ test is seen to fail.
 
 ## Branch and merge
 
-`main` is the fork's trunk: upstream plus every fix topic, this plan, and the engine. Each slice, or a
-few closely related ones, is a pull request into `main` from its own branch (`strip/<slice>`) and
-closes its issue. Fix topics meant for upstream branch from `upstream/main`, so they carry nothing
-fork-only. `.git/rebuild-fork.sh` builds `fork` from `main` and the topics and tags it; EFV pins the
-tag's revision.
+`main` stays a pure mirror of upstream's `main`. The fix topics branch from it, so each can go
+upstream as a pull request. `topic/stream-strip` is fork-only: it branches from a `fork` build,
+because it builds on every fix topic, and holds this plan and the engine. Each slice, or a few
+closely related ones, is a pull request into `topic/stream-strip` from its own branch
+(`strip/<slice>`); its issue is closed by hand, since nothing merges into the default branch.
+`.git/rebuild-fork.sh` builds `fork` from `main` and the topics, `topic/stream-strip` last, and tags
+it; EFV pins the tag's revision.
