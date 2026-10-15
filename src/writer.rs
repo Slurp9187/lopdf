@@ -445,7 +445,7 @@ impl Writer {
     /// Write Cross Reference Table.
     ///
     /// Note: This is different from a "Cross Reference Stream".
-    fn write_xref(file: &mut dyn Write, xref: &Xref) -> Result<()> {
+    pub(crate) fn write_xref(file: &mut dyn Write, xref: &Xref) -> Result<()> {
         writeln!(file, "xref")?;
 
         let mut sections = Self::xref_sections(xref);
@@ -474,7 +474,7 @@ impl Writer {
     }
 
     /// Create stream for Cross reference stream.
-    fn create_xref_steam(xref: &Xref, filter: XRefStreamFilter) -> Result<(Vec<u8>, usize, Object)> {
+    pub(crate) fn create_xref_steam(xref: &Xref, filter: XRefStreamFilter) -> Result<(Vec<u8>, usize, Object)> {
         let mut xref_stream = Vec::new();
         let mut xref_index = Vec::new();
 

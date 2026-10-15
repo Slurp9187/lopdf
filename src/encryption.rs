@@ -912,10 +912,19 @@ impl EncryptionState {
 /// only filter, or the matching element of a `/DecodeParms` array. Without a
 /// `/Name` there, the filter is `/Identity` (ISO 32000-1, 7.4.10).
 fn stream_crypt_filter_name(stream: &Stream) -> Option<&[u8]> {
-    let filters = stream.filters().ok()?;
+    crypt_filter_name(&stream.dict)
+}
+
+/// [`stream_crypt_filter_name`] for a stream known only by its dictionary.
+fn crypt_filter_name(dict: &Dictionary) -> Option<&[u8]> {
+    let filters: Vec<&[u8]> = match dict.get(b"Filter").ok()? {
+        Object::Name(name) => vec![name],
+        Object::Array(names) => names.iter().map(Object::as_name).collect::<Result<_, _>>().ok()?,
+        _ => return None,
+    };
     let position = filters.iter().position(|filter| *filter == b"Crypt")?;
 
-    let parameters = match stream.dict.get(b"DecodeParms") {
+    let parameters = match dict.get(b"DecodeParms") {
         Ok(Object::Dictionary(dict)) if filters.len() == 1 => Some(dict),
         Ok(Object::Array(parameters)) => parameters.get(position).and_then(|object| object.as_dict().ok()),
         _ => None,
@@ -926,6 +935,26 @@ fn stream_crypt_filter_name(stream: &Stream) -> Option<&[u8]> {
             .and_then(|dict| dict.get(b"Name").and_then(Object::as_name).ok())
             .unwrap_or(b"Identity"),
     )
+}
+
+/// The chunk decipher for the data of stream `obj_id`, known by its dictionary `dict`, under the
+/// rules [`decrypt_object`] applies to a whole stream: Identity for a cross-reference stream, and
+/// for `/Metadata` when metadata is not encrypted; otherwise the stream's own `/Crypt` filter, or
+/// `/StmF`. `None` when that crypt filter cannot decrypt in chunks. The streaming Strip uses it.
+pub(crate) fn stream_decipher(
+    state: &EncryptionState, obj_id: ObjectId, dict: &Dictionary,
+) -> Result<Option<Box<dyn stream::ChunkDecipher>>, DecryptionError> {
+    let exempt = dict.has_type(b"XRef") || (dict.has_type(b"Metadata") && !state.encrypt_metadata);
+    if exempt {
+        return Ok(Some(Box::new(stream::IdentityDecipher)));
+    }
+
+    let crypt_filter = match crypt_filter_name(dict) {
+        Some(name) => state.crypt_filter(name)?,
+        None => state.get_stream_filter()?,
+    };
+    let key = Zeroizing::new(crypt_filter.compute_key(&state.file_encryption_key, obj_id)?);
+    crypt_filter.chunked_decrypt(&key)
 }
 
 /// Which way a crypt filter is applied to an object's payload.
