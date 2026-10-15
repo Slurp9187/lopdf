@@ -3,7 +3,7 @@ pub mod crypt_filters;
 mod pkcs5;
 mod rc4;
 
-use crate::{Dictionary, Document, Error, Object, ObjectId};
+use crate::{Dictionary, Document, Error, Object, ObjectId, Stream};
 use bitflags::bitflags;
 use crypt_filters::*;
 use std::collections::BTreeMap;
@@ -63,6 +63,8 @@ pub enum DecryptionError {
     StringPrep(#[from] stringprep::Error),
     #[error("invalid padding encountered when decrypting, key might be incorrect")]
     Padding,
+    #[error("a crypt filter name is neither /Identity nor an entry in /CF")]
+    UnknownCryptFilter,
 }
 
 bitflags! {
@@ -542,7 +544,7 @@ fn r4_state(params: R4Params<'_>, crypt_filters: Option<CryptFilters>) -> Result
 
     let (crypt_filters, stream_filter, string_filter) = crypt_filters.unwrap_or_default();
 
-    Ok(EncryptionState {
+    let state = EncryptionState {
         version: algorithm.version,
         revision: algorithm.revision,
         key_length: algorithm.length,
@@ -556,7 +558,11 @@ fn r4_state(params: R4Params<'_>, crypt_filters: Option<CryptFilters>) -> Result
         // The corrected bits, which `r4_algorithm` recorded on the algorithm.
         permissions: algorithm.permissions,
         ..Default::default()
-    })
+    };
+
+    state.check_crypt_filters()?;
+
+    Ok(state)
 }
 
 /// An [`PasswordAlgorithm`] seeded for one of the MD5-based revisions
@@ -620,7 +626,7 @@ fn aes256_state(revision: i64, params: Aes256Params<'_>) -> Result<EncryptionSta
 
     algorithm.permission_encrypted = algorithm.compute_permissions(file_encryption_key)?;
 
-    Ok(EncryptionState {
+    let state = EncryptionState {
         version: algorithm.version,
         revision: algorithm.revision,
         key_length: algorithm.length,
@@ -636,7 +642,11 @@ fn aes256_state(revision: i64, params: Aes256Params<'_>) -> Result<EncryptionSta
         permissions: algorithm.permissions,
         permission_encrypted: algorithm.permission_encrypted,
         encrypt_object_id: None,
-    })
+    };
+
+    state.check_crypt_filters()?;
+
+    Ok(state)
 }
 
 impl EncryptionState {
@@ -773,6 +783,8 @@ impl EncryptionState {
             }
         }
 
+        state.check_crypt_filters()?;
+
         Ok(state)
     }
 
@@ -824,19 +836,64 @@ impl EncryptionState {
         Ok(encrypted)
     }
 
-    pub fn get_stream_filter(&self) -> Arc<dyn CryptFilter> {
-        self.crypt_filters
-            .get(&self.stream_filter)
-            .cloned()
-            .unwrap_or(Arc::new(Rc4CryptFilter))
+    /// The crypt filter that `/StmF` selects for streams.
+    pub fn get_stream_filter(&self) -> Result<Arc<dyn CryptFilter>, DecryptionError> {
+        self.crypt_filter(&self.stream_filter)
     }
 
-    pub fn get_string_filter(&self) -> Arc<dyn CryptFilter> {
-        self.crypt_filters
-            .get(&self.string_filter)
-            .cloned()
-            .unwrap_or(Arc::new(Rc4CryptFilter))
+    /// The crypt filter that `/StrF` selects for strings.
+    pub fn get_string_filter(&self) -> Result<Arc<dyn CryptFilter>, DecryptionError> {
+        self.crypt_filter(&self.string_filter)
     }
+
+    /// The crypt filter `name` selects (ISO 32000-1, 7.6.5). Before `V4` every
+    /// string and stream uses RC4. From `V4` on, `/Identity` is predefined and
+    /// is also the default when `/StmF`, `/StrF` or a stream's `/Crypt` name is
+    /// absent; any other name must be an entry in `/CF`.
+    fn crypt_filter(&self, name: &[u8]) -> Result<Arc<dyn CryptFilter>, DecryptionError> {
+        if self.version < 4 {
+            return Ok(Arc::new(Rc4CryptFilter));
+        }
+
+        if name.is_empty() || name == b"Identity" {
+            return Ok(Arc::new(IdentityCryptFilter));
+        }
+
+        self.crypt_filters
+            .get(name)
+            .cloned()
+            .ok_or(DecryptionError::UnknownCryptFilter)
+    }
+
+    /// Fails if `/StmF` or `/StrF` names a crypt filter that does not exist,
+    /// rather than leaving the mistake to surface as wrong bytes later.
+    fn check_crypt_filters(&self) -> Result<(), DecryptionError> {
+        self.get_stream_filter()?;
+        self.get_string_filter()?;
+        Ok(())
+    }
+}
+
+/// The name of the crypt filter a stream's own `/Crypt` filter selects, or
+/// `None` when `/Filter` has no `/Crypt`. The parameters belong to `/Crypt`'s
+/// position in `/Filter`: the `/DecodeParms` dictionary when `/Crypt` is the
+/// only filter, or the matching element of a `/DecodeParms` array. Without a
+/// `/Name` there, the filter is `/Identity` (ISO 32000-1, 7.4.10).
+fn stream_crypt_filter_name(stream: &Stream) -> Option<&[u8]> {
+    let filters = stream.filters().ok()?;
+    let position = filters.iter().position(|filter| *filter == b"Crypt")?;
+
+    let parameters = match stream.dict.get(b"DecodeParms") {
+        Ok(Object::Dictionary(dict)) if filters.len() == 1 => Some(dict),
+        Ok(Object::Array(parameters)) => parameters.get(position).and_then(|object| object.as_dict().ok()),
+        _ => None,
+    };
+
+    Some(
+        parameters
+            .and_then(|dict| dict.get(b"Name").and_then(Object::as_name).ok())
+            .unwrap_or(b"Identity"),
+    )
 }
 
 /// Which way a crypt filter is applied to an object's payload.
@@ -873,26 +930,13 @@ fn transform_object(
         return Ok(());
     }
 
-    // A stream's DecodeParms /Crypt /Name may override the document's default crypt filter;
-    // Identity is used when absent.
-    let override_crypt_filter = obj
-        .as_stream()
-        .ok()
-        .filter(|stream| {
-            stream
-                .filters()
-                .map(|filters| filters.contains(&&b"Crypt"[..]))
-                .unwrap_or(false)
-        })
-        .and_then(|stream| stream.dict.get(b"DecodeParms").ok())
-        .and_then(|object| object.as_dict().ok())
-        .map(|dict| {
-            dict.get(b"Name")
-                .and_then(|object| object.as_name())
-                .ok()
-                .and_then(|name| state.crypt_filters.get(name).cloned())
-                .unwrap_or(Arc::new(IdentityCryptFilter))
-        });
+    // A stream's own /Crypt filter overrides the document's default crypt filter.
+    let override_crypt_filter = match obj.as_stream() {
+        Ok(stream) => stream_crypt_filter_name(stream)
+            .map(|name| state.crypt_filter(name))
+            .transpose()?,
+        Err(_) => None,
+    };
 
     // Retrieve the payload and the crypt filter to use to transform it.
     let (mut crypt_filter, payload) = match obj {
@@ -914,8 +958,8 @@ fn transform_object(
         }
         // Encryption applies to all strings and streams in the document's PDF file. We return the
         // crypt filter and the content here.
-        Object::String(content, _) => (state.get_string_filter(), &*content),
-        Object::Stream(stream) => (state.get_stream_filter(), &stream.content),
+        Object::String(content, _) => (state.get_string_filter()?, &*content),
+        Object::Stream(stream) => (state.get_stream_filter()?, &stream.content),
         // Encryption is not applied to other object types such as integers and boolean values.
         _ => {
             return Ok(());
