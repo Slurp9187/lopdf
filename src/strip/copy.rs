@@ -328,11 +328,19 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
                 XrefType::CrossReferenceTable
             },
         );
-        for (offset, id, generation) in objects {
+        // Each object ends, at the latest, where the next one starts: the bound for recovering a
+        // stream whose /Length is wrong.
+        let bounds: Vec<u64> = objects
+            .iter()
+            .skip(1)
+            .map(|(offset, ..)| self.index.base + offset)
+            .chain(std::iter::once(self.source.len()))
+            .collect();
+        for ((offset, id, generation), bound) in objects.into_iter().zip(bounds) {
             let entry = if Some((id, generation)) == encrypt_id {
                 XrefEntry::Free
             } else {
-                match self.copy_object((id, generation), offset, &containers)? {
+                match self.copy_object((id, generation), offset, bound, &containers)? {
                     Some(at) => XrefEntry::Normal {
                         offset: u32::try_from(at)?,
                         generation,
@@ -355,7 +363,7 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
     /// Copies the object `id` at `offset`, decrypted, and returns where it starts in the output, or
     /// `None` for an object that is not copied: an old cross-reference stream, or the linearization
     /// dictionary and its hint streams, which describe a layout the output does not have.
-    fn copy_object(&mut self, id: ObjectId, offset: u64, containers: &HashSet<u32>) -> Result<Option<u64>> {
+    fn copy_object(&mut self, id: ObjectId, offset: u64, bound: u64, containers: &HashSet<u32>) -> Result<Option<u64>> {
         if self.hint_streams.contains(&offset) {
             return Ok(None);
         }
@@ -402,7 +410,7 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
                 if containers.contains(&id.0) && !dict.has_type(b"ObjStm") {
                     return Err(fallback(StripFallback::BadObjectStream));
                 }
-                self.copy_stream(id, dict, at + data_start as u64)?;
+                self.copy_stream(id, dict, at + data_start as u64, bound)?;
             }
         }
 
@@ -419,9 +427,14 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
 
     /// Copies a stream whose data starts at `data_at`: the dictionary with its strings decrypted and
     /// the plaintext `/Length`, then the data through a chunk decipher.
-    fn copy_stream(&mut self, id: ObjectId, dict: Dictionary, data_at: u64) -> Result<()> {
+    fn copy_stream(&mut self, id: ObjectId, dict: Dictionary, data_at: u64, bound: u64) -> Result<()> {
         let length = self.resolve_length(dict.get(b"Length").ok())?;
-        self.check_endstream(data_at, length)?;
+        // A wrong /Length is recovered as a lenient load recovers it.
+        let length = if self.endstream_follows(data_at, length)? {
+            length
+        } else {
+            self.recover_length(data_at, bound)?
+        };
 
         let mut decipher = encryption::stream_decipher(self.state()?, id, &dict)?
             .ok_or(fallback(StripFallback::UnsupportedCryptFilter))?;
@@ -479,16 +492,84 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
 
     /// Checks that `endstream` follows the data, after an optional end of line.
     fn check_endstream(&mut self, data_at: u64, length: u64) -> Result<()> {
+        if !self.endstream_follows(data_at, length)? {
+            return Err(fallback(StripFallback::LengthMismatch));
+        }
+        Ok(())
+    }
+
+    /// Whether `endstream` follows `length` bytes of data at `data_at`, after an optional end of
+    /// line.
+    fn endstream_follows(&mut self, data_at: u64, length: u64) -> Result<bool> {
         let after = self.source.window(data_at + length, 11)?;
         let rest = after
             .strip_prefix(b"\r\n")
             .or_else(|| after.strip_prefix(b"\n"))
             .or_else(|| after.strip_prefix(b"\r"))
             .unwrap_or(&after);
-        if !rest.starts_with(b"endstream") {
-            return Err(fallback(StripFallback::LengthMismatch));
+        Ok(rest.starts_with(b"endstream"))
+    }
+
+    /// The length of the stream data at `data_at` when its `/Length` is wrong, by the rule a
+    /// lenient load uses: the data ends at the only `endstream` before `bound` that follows an end
+    /// of line and is followed by `endobj`. The scan reads a chunk at a time, keeping a few bytes
+    /// of the last one so that a marker across two chunks is still seen.
+    fn recover_length(&mut self, data_at: u64, bound: u64) -> Result<u64> {
+        const MARKER: &[u8] = b"endstream";
+        // Two bytes of end of line before the marker.
+        const CARRY: usize = MARKER.len() + 1;
+
+        let mut found = None;
+        let mut window_at = data_at;
+        while window_at < bound {
+            let size = ((bound - window_at) as usize).min(CHUNK);
+            let window = self.source.window(window_at, size)?;
+            for (at, candidate) in window.windows(MARKER.len()).enumerate() {
+                if candidate != MARKER {
+                    continue;
+                }
+                let marker_at = window_at + at as u64;
+                let Some(data_end) = self.data_end_before(data_at, marker_at, bound)? else {
+                    continue;
+                };
+                if found.is_some_and(|end| end != data_end) {
+                    return Err(fallback(StripFallback::LengthMismatch));
+                }
+                found = Some(data_end);
+            }
+            if window_at + size as u64 >= bound {
+                break;
+            }
+            // Step back over the bytes a marker split across this chunk and the next may need.
+            window_at += (size - CARRY.min(size)).max(1) as u64;
         }
-        Ok(())
+
+        let data_end = found.ok_or(fallback(StripFallback::LengthMismatch))?;
+        Ok(data_end - data_at)
+    }
+
+    /// Where the data ends if the `endstream` at `marker_at` closes the stream: after an end of
+    /// line, and followed by `endobj` and then white space or `bound`. `None` otherwise.
+    fn data_end_before(&mut self, data_at: u64, marker_at: u64, bound: u64) -> Result<Option<u64>> {
+        let before_at = marker_at.saturating_sub(2).max(data_at);
+        let before = self.source.window(before_at, (marker_at - before_at) as usize)?;
+        let data_end = if before.ends_with(b"\r\n") {
+            marker_at - 2
+        } else if before.ends_with(b"\n") || before.ends_with(b"\r") {
+            marker_at - 1
+        } else {
+            return Ok(None);
+        };
+
+        let after_at = marker_at + 9;
+        let after = self
+            .source
+            .window(after_at, (bound.saturating_sub(after_at) as usize).min(64))?;
+        let rest = &after[after.iter().take_while(|byte| b" \t\r\n\x0C\0".contains(byte)).count()..];
+        let ends_object = rest
+            .strip_prefix(b"endobj")
+            .is_some_and(|tail| tail.first().is_none_or(|byte| b" \t\r\n\x0C\0".contains(byte)));
+        Ok(ends_object.then_some(data_end))
     }
 
     fn resolve_length(&mut self, length: Option<&Object>) -> Result<u64> {
