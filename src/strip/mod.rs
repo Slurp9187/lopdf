@@ -7,7 +7,10 @@
 
 // Nothing calls the index pass until `strip()` arrives in S5, which must remove this.
 #![cfg_attr(not(test), expect(dead_code, reason = "used by strip() from S5 on"))]
-#![cfg_attr(test, allow(dead_code, reason = "some tests are compiled out with the async feature"))]
+#![cfg_attr(
+    test,
+    allow(dead_code, reason = "some tests are compiled out with the async feature")
+)]
 
 mod index;
 mod source;
