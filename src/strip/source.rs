@@ -30,6 +30,12 @@ impl<R: Read + Seek> Source<R> {
         }
         Ok(window)
     }
+
+    /// Fills `buffer` from `offset`, which must leave that many bytes in the source.
+    pub(crate) fn read_into(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+        self.inner.seek(SeekFrom::Start(offset))?;
+        self.inner.read_exact(buffer)
+    }
 }
 
 #[cfg(test)]
