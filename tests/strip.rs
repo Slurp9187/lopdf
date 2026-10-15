@@ -2,7 +2,7 @@
 //! the objects a password load gives, and a failure is the same error.
 
 use lopdf::encryption::crypt_filters::{Aes128CryptFilter, Aes256CryptFilter, CryptFilter};
-use lopdf::strip::{StripFallback, StripOptions, strip};
+use lopdf::strip::{StripFallback, StripObserver, StripOptions, strip, strip_observed, verify_stripped};
 use lopdf::{
     Document, EncryptionState, EncryptionVersion, Error, LoadOptions, Object, ObjectId, Permissions, Stream, dictionary,
 };
@@ -155,6 +155,20 @@ fn encrypted_document(mut doc: Document, version: &str) -> Document {
             key_length: 128,
             permissions: Permissions::all(),
         }),
+        // Streams stored as they are, strings in AES-128.
+        "Identity" => {
+            let aes: Arc<dyn CryptFilter> = Arc::new(Aes128CryptFilter);
+            EncryptionState::try_from(EncryptionVersion::V4 {
+                document: &doc,
+                encrypt_metadata: true,
+                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes)]),
+                stream_filter: b"Identity".to_vec(),
+                string_filter: b"StdCF".to_vec(),
+                owner_password: OWNER,
+                user_password: USER,
+                permissions: Permissions::all(),
+            })
+        }
         "AES-128" => {
             let aes: Arc<dyn CryptFilter> = Arc::new(Aes128CryptFilter);
             EncryptionState::try_from(EncryptionVersion::V4 {
@@ -247,15 +261,53 @@ fn an_unencrypted_file_is_refused() {
 }
 
 #[test]
-fn a_wrong_stream_length_needs_the_whole_document_path() {
-    let bytes = encrypted(document(1000), "RC4");
-    // RC4 keeps the length, so the content stream's /Length is 1000; make it 999.
-    let at = bytes.windows(13).position(|window| window == b"/Length 1000>").unwrap();
-    let mut damaged = bytes.clone();
-    damaged[at..at + 13].copy_from_slice(b"/Length  999>");
+fn a_wrong_stream_length_is_recovered_as_a_lenient_load_recovers_it() {
+    // RC4 keeps the length, so the content stream's /Length is its plaintext length. The longer
+    // streams end past the first 64 KiB the scan reads; at 131,067 bytes, `endstream` straddles the
+    // 128 KiB mark, where a scan that kept nothing of the previous chunk would split it.
+    for (content_len, found, wrong) in [
+        (1000, &b"/Length 1000>"[..], &b"/Length  999>"[..]),
+        (150_001, &b"/Length 150001>"[..], &b"/Length  99999>"[..]),
+        (131_067, &b"/Length 131067>"[..], &b"/Length  99999>"[..]),
+    ] {
+        let mut bytes = encrypted(document(content_len), "RC4");
+        let at = bytes.windows(found.len()).position(|window| window == found).unwrap();
+        bytes[at..at + wrong.len()].copy_from_slice(wrong);
+        assert_matches_whole(&bytes, USER);
+    }
+}
+
+#[test]
+fn an_endstream_without_endobj_after_it_does_not_end_the_stream() {
+    // The stored data holds `endstream` after an end of line, but no `endobj` follows it, so
+    // only the real end qualifies and the wrong /Length is recovered.
+    let mut doc = document(10);
+    let mut data = b"first part\nendstream but no end of object here".to_vec();
+    data.resize(64, b'.');
+    let id = doc.add_object(Stream::new(dictionary! {}, data));
+    doc.trailer.set("Extra", id);
+    let mut bytes = encrypted(doc, "Identity");
+    let at = bytes.windows(11).position(|window| window == b"/Length 64>").unwrap();
+    bytes[at..at + 11].copy_from_slice(b"/Length 63>");
+
+    assert_matches_whole(&bytes, USER);
+}
+
+#[test]
+fn an_ambiguous_end_of_stream_needs_the_whole_document_path() {
+    // Data stored as it is that holds what looks like the end of the stream, and a wrong /Length:
+    // two places could end it.
+    let mut doc = document(10);
+    let mut data = b"first part\nendstream\nendobj\nsecond part".to_vec();
+    data.resize(64, b'.');
+    let id = doc.add_object(Stream::new(dictionary! {}, data));
+    doc.trailer.set("Extra", id);
+    let mut bytes = encrypted(doc, "Identity");
+    let at = bytes.windows(11).position(|window| window == b"/Length 64>").unwrap();
+    bytes[at..at + 11].copy_from_slice(b"/Length 63>");
 
     assert!(matches!(
-        stripped(&damaged, USER),
+        stripped(&bytes, USER),
         Err(Error::NeedsWholeDocument(StripFallback::LengthMismatch))
     ));
 }
@@ -358,4 +410,128 @@ fn an_update_that_drops_encrypt_needs_the_whole_document_path() {
         stripped(&bytes, USER),
         Err(Error::NeedsWholeDocument(StripFallback::InconsistentEncrypt))
     ));
+}
+
+/// What an observer saw, with each stream's data joined: the two sides may cut it differently.
+#[derive(Debug, Default, PartialEq)]
+struct Recorder {
+    events: Vec<Event>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Event {
+    Object(ObjectId),
+    String(Vec<u8>),
+    Stream { length: u64, data: Vec<u8> },
+}
+
+impl StripObserver for Recorder {
+    fn object(&mut self, id: ObjectId) {
+        self.events.push(Event::Object(id));
+    }
+
+    fn string(&mut self, plaintext: &[u8]) {
+        self.events.push(Event::String(plaintext.to_vec()));
+    }
+
+    fn stream(&mut self, length: u64) {
+        self.events.push(Event::Stream {
+            length,
+            data: Vec::new(),
+        });
+    }
+
+    fn stream_data(&mut self, plaintext: &[u8]) {
+        match self.events.last_mut() {
+            Some(Event::Stream { data, .. }) => data.extend_from_slice(plaintext),
+            _ => panic!("stream data outside a stream"),
+        }
+    }
+}
+
+/// Strips `bytes`, recording what the Strip wrote, and returns that with the output.
+fn observed(bytes: &[u8], password: &str) -> (Recorder, Vec<u8>) {
+    let mut recorder = Recorder::default();
+    let mut output = Vec::new();
+    strip_observed(
+        Cursor::new(bytes),
+        &mut output,
+        &StripOptions::with_password(password),
+        &mut recorder,
+    )
+    .unwrap();
+    (recorder, output)
+}
+
+fn read_back(output: &[u8]) -> lopdf::Result<Recorder> {
+    let mut recorder = Recorder::default();
+    verify_stripped(Cursor::new(output), &mut recorder)?;
+    Ok(recorder)
+}
+
+#[test]
+fn reading_the_output_back_sees_what_the_strip_wrote() {
+    let mut files = vec![
+        (std::fs::read("assets/encrypted.pdf").unwrap(), ""),
+        (std::fs::read("tests/fixtures/crypt/identity-stmf.pdf").unwrap(), USER),
+        (
+            std::fs::read("tests/fixtures/crypt/stream-dict-string.pdf").unwrap(),
+            USER,
+        ),
+    ];
+    for version in ["RC4", "AES-128", "AES-256"] {
+        files.push((encrypted(document(150_001), version), USER));
+    }
+
+    let (mut strings, mut streams) = (0, 0);
+    for (bytes, password) in files {
+        let (written, output) = observed(&bytes, password);
+        assert!(!written.events.is_empty());
+        strings += written
+            .events
+            .iter()
+            .filter(|event| matches!(event, Event::String(_)))
+            .count();
+        streams += written
+            .events
+            .iter()
+            .filter(|event| matches!(event, Event::Stream { .. }))
+            .count();
+        assert_eq!(read_back(&output).unwrap(), written);
+    }
+    assert!(strings > 0 && streams > 0);
+}
+
+#[test]
+fn a_changed_byte_in_the_output_is_seen() {
+    let (written, output) = observed(&encrypted(document(1000), "AES-256"), USER);
+
+    for needle in [&b"BT (stream) Tj ET"[..], b"A title"] {
+        let at = output
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap();
+        let mut changed = output.clone();
+        changed[at] ^= 0x01;
+        assert_ne!(
+            read_back(&changed).unwrap(),
+            written,
+            "{}",
+            String::from_utf8_lossy(needle)
+        );
+    }
+}
+
+#[test]
+fn an_output_that_does_not_read_back_fails_the_check() {
+    let (_, output) = observed(&encrypted(document(1000), "AES-256"), USER);
+
+    // An object under another number than its cross-reference entry says.
+    let at = output.windows(8).position(|window| window == b"\n6 0 obj").unwrap();
+    let mut renumbered = output.clone();
+    renumbered[at + 1] = b'9';
+    assert!(read_back(&renumbered).is_err());
+
+    let truncated = &output[..output.len() / 2];
+    assert!(read_back(truncated).is_err());
 }

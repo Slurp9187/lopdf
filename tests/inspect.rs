@@ -1,7 +1,7 @@
 //! `strip::inspect`: what a file is before a Strip, or for keeping it encrypted as it is.
 
 use lopdf::encryption::crypt_filters::{Aes256CryptFilter, CryptFilter};
-use lopdf::strip::{PasswordCheck, Signed, StripFallback, inspect};
+use lopdf::strip::{PasswordCheck, Signed, StripFallback, UsageRights, inspect};
 use lopdf::{Dictionary, Document, EncryptionState, EncryptionVersion, Error, Object, Permissions, dictionary};
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -172,14 +172,17 @@ fn a_usage_rights_signature_is_reported_apart_from_signed_fields() {
     // The form's catalog holds /Perms /UR3, and no signed signature field.
     let bytes = std::fs::read("assets/encrypted.pdf").unwrap();
     let found = inspect_bytes(&bytes, None).unwrap();
-    assert!(found.usage_rights);
+    assert_eq!(found.usage_rights, UsageRights::Yes);
     assert_eq!(found.signed, Signed::No);
 
     for bytes in [
         std::fs::read("tests/fixtures/crypt/identity-stmf.pdf").unwrap(),
         std::fs::read("assets/example.pdf").unwrap(),
     ] {
-        assert!(!inspect_bytes(&bytes, Some("user")).unwrap().usage_rights);
+        assert_eq!(
+            inspect_bytes(&bytes, Some("user")).unwrap().usage_rights,
+            UsageRights::No
+        );
     }
 }
 
@@ -192,7 +195,7 @@ fn the_older_usage_rights_entry_counts_too() {
         .set("Perms", dictionary! { "UR" => dictionary! { "Type" => "Sig" } });
     let mut bytes = Vec::new();
     doc.save_to(&mut bytes).unwrap();
-    assert!(inspect_bytes(&bytes, None).unwrap().usage_rights);
+    assert_eq!(inspect_bytes(&bytes, None).unwrap().usage_rights, UsageRights::Yes);
 }
 
 /// Appends an empty incremental update whose trailer leaves out `/Encrypt`.

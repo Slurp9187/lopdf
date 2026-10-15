@@ -3,7 +3,10 @@
 
 use super::index::{Index, read_index};
 use super::source::Source;
-use super::{Caps, Inspection, PasswordCheck, Signed, StripFallback, StripOptions, StripReport};
+use super::{
+    Caps, Inspection, PasswordCheck, Signed, StripFallback, StripObserver, StripOptions, StripReport, Unobserved,
+    UsageRights, observe_strings,
+};
 use crate::encryption::stream::{ChunkDecipher, IdentityDecipher, MAX_EXPANSION};
 use crate::encryption::{self, PasswordAlgorithm};
 use crate::parser::{self, ObjectHead};
@@ -27,7 +30,7 @@ fn fallback(reason: StripFallback) -> Error {
 
 /// Strips `input` into `output`. See [`super::strip`].
 pub(crate) fn strip<R: Read + Seek, W: Write>(
-    input: R, output: W, options: &StripOptions, caps: &Caps,
+    input: R, output: W, options: &StripOptions, caps: &Caps, observer: &mut dyn StripObserver,
 ) -> Result<StripReport> {
     let mut source = Source::new(input)?;
     let index = read_index(&mut source, caps)?;
@@ -48,7 +51,7 @@ pub(crate) fn strip<R: Read + Seek, W: Write>(
     };
     let state = decryption_state(&stand_in, password)?;
 
-    let mut stripper = Stripper::new(source, output, index, Some(state), caps);
+    let mut stripper = Stripper::new(source, output, index, Some(state), caps, observer);
     stripper.copy(&version, encrypt_id)?;
     Ok(stripper.report)
 }
@@ -101,7 +104,8 @@ pub(crate) fn inspect<R: Read + Seek>(input: R, password: Option<&str>, caps: &C
         }
     }
 
-    let mut stripper = Stripper::new(source, io::sink(), index, state, caps);
+    let mut unobserved = Unobserved;
+    let mut stripper = Stripper::new(source, io::sink(), index, state, caps, &mut unobserved);
     stripper.encrypted = encrypted;
     let signed = stripper.signed();
     let usage_rights = stripper.usage_rights();
@@ -254,7 +258,7 @@ struct Container {
     members: Vec<(u32, usize)>,
 }
 
-struct Stripper<R, W> {
+struct Stripper<'o, R, W> {
     source: Source<R>,
     out: Output<W>,
     index: Index,
@@ -272,10 +276,15 @@ struct Stripper<R, W> {
     input: Zeroizing<Vec<u8>>,
     output: Zeroizing<Vec<u8>>,
     report: StripReport,
+    /// Sees the plaintext of every object written.
+    observer: &'o mut dyn StripObserver,
 }
 
-impl<R: Read + Seek, W: Write> Stripper<R, W> {
-    fn new(source: Source<R>, output: W, index: Index, state: Option<EncryptionState>, caps: &Caps) -> Self {
+impl<'o, R: Read + Seek, W: Write> Stripper<'o, R, W> {
+    fn new(
+        source: Source<R>, output: W, index: Index, state: Option<EncryptionState>, caps: &Caps,
+        observer: &'o mut dyn StripObserver,
+    ) -> Self {
         Self {
             source,
             out: Output {
@@ -292,6 +301,7 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
             input: Zeroizing::new(vec![0; CHUNK]),
             output: Zeroizing::new(vec![0; CHUNK + MAX_EXPANSION]),
             report: StripReport::default(),
+            observer,
         }
     }
 
@@ -328,11 +338,19 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
                 XrefType::CrossReferenceTable
             },
         );
-        for (offset, id, generation) in objects {
+        // Each object ends, at the latest, where the next one starts: the bound for recovering a
+        // stream whose /Length is wrong.
+        let bounds: Vec<u64> = objects
+            .iter()
+            .skip(1)
+            .map(|(offset, ..)| self.index.base + offset)
+            .chain(std::iter::once(self.source.len()))
+            .collect();
+        for ((offset, id, generation), bound) in objects.into_iter().zip(bounds) {
             let entry = if Some((id, generation)) == encrypt_id {
                 XrefEntry::Free
             } else {
-                match self.copy_object((id, generation), offset, &containers)? {
+                match self.copy_object((id, generation), offset, bound, &containers)? {
                     Some(at) => XrefEntry::Normal {
                         offset: u32::try_from(at)?,
                         generation,
@@ -355,7 +373,7 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
     /// Copies the object `id` at `offset`, decrypted, and returns where it starts in the output, or
     /// `None` for an object that is not copied: an old cross-reference stream, or the linearization
     /// dictionary and its hint streams, which describe a layout the output does not have.
-    fn copy_object(&mut self, id: ObjectId, offset: u64, containers: &HashSet<u32>) -> Result<Option<u64>> {
+    fn copy_object(&mut self, id: ObjectId, offset: u64, bound: u64, containers: &HashSet<u32>) -> Result<Option<u64>> {
         if self.hint_streams.contains(&offset) {
             return Ok(None);
         }
@@ -381,6 +399,7 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
             }
             ObjectHead::Direct { object, end } if !has_strings(&object) => {
                 // Nothing to decrypt: copy the bytes as they are.
+                self.observer.object(id);
                 let from = window.iter().take_while(|byte| byte.is_ascii_whitespace()).count();
                 self.out.write_all(&window[from..end])?;
                 if !window[..end].last().is_some_and(u8::is_ascii_whitespace) {
@@ -391,7 +410,11 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
                 let result = self
                     .state()
                     .and_then(|state| Ok(encryption::decrypt_object(state, id, &mut object)?))
-                    .and_then(|()| self.write_direct(id, &object));
+                    .and_then(|()| {
+                        self.observer.object(id);
+                        observe_strings(self.observer, &object);
+                        self.write_direct(id, &object)
+                    });
                 wipe_object(&mut object);
                 result?;
             }
@@ -402,7 +425,7 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
                 if containers.contains(&id.0) && !dict.has_type(b"ObjStm") {
                     return Err(fallback(StripFallback::BadObjectStream));
                 }
-                self.copy_stream(id, dict, at + data_start as u64)?;
+                self.copy_stream(id, dict, at + data_start as u64, bound)?;
             }
         }
 
@@ -419,9 +442,14 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
 
     /// Copies a stream whose data starts at `data_at`: the dictionary with its strings decrypted and
     /// the plaintext `/Length`, then the data through a chunk decipher.
-    fn copy_stream(&mut self, id: ObjectId, dict: Dictionary, data_at: u64) -> Result<()> {
+    fn copy_stream(&mut self, id: ObjectId, dict: Dictionary, data_at: u64, bound: u64) -> Result<()> {
         let length = self.resolve_length(dict.get(b"Length").ok())?;
-        self.check_endstream(data_at, length)?;
+        // A wrong /Length is recovered as a lenient load recovers it.
+        let length = if self.endstream_follows(data_at, length)? {
+            length
+        } else {
+            self.recover_length(data_at, bound)?
+        };
 
         let mut decipher = encryption::stream_decipher(self.state()?, id, &dict)?
             .ok_or(fallback(StripFallback::UnsupportedCryptFilter))?;
@@ -440,6 +468,9 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
                     dict.set("Length", plaintext_len as i64);
                     remove_crypt_filter(dict);
                 }
+                self.observer.object(id);
+                observe_strings(self.observer, &dict);
+                self.observer.stream(plaintext_len as u64);
                 writeln!(self.out, "{} {} obj", id.0, id.1)?;
                 Writer::write_object(&mut self.out, &dict)?;
                 self.out.write_all(b"\nstream\n")?;
@@ -468,27 +499,97 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
             let n = (length - done).min(CHUNK as u64) as usize;
             self.source.read_into(data_at + done, &mut self.input[..n])?;
             let decrypted = decipher.update(&self.input[..n], &mut self.output)?;
+            self.observer.stream_data(&self.output[..decrypted]);
             self.out.write_all(&self.output[..decrypted])?;
             written += decrypted;
             done += n as u64;
         }
         let decrypted = decipher.finish(&mut self.output)?;
+        self.observer.stream_data(&self.output[..decrypted]);
         self.out.write_all(&self.output[..decrypted])?;
         Ok(written + decrypted)
     }
 
     /// Checks that `endstream` follows the data, after an optional end of line.
     fn check_endstream(&mut self, data_at: u64, length: u64) -> Result<()> {
+        if !self.endstream_follows(data_at, length)? {
+            return Err(fallback(StripFallback::LengthMismatch));
+        }
+        Ok(())
+    }
+
+    /// Whether `endstream` follows `length` bytes of data at `data_at`, after an optional end of
+    /// line.
+    fn endstream_follows(&mut self, data_at: u64, length: u64) -> Result<bool> {
         let after = self.source.window(data_at + length, 11)?;
         let rest = after
             .strip_prefix(b"\r\n")
             .or_else(|| after.strip_prefix(b"\n"))
             .or_else(|| after.strip_prefix(b"\r"))
             .unwrap_or(&after);
-        if !rest.starts_with(b"endstream") {
-            return Err(fallback(StripFallback::LengthMismatch));
+        Ok(rest.starts_with(b"endstream"))
+    }
+
+    /// The length of the stream data at `data_at` when its `/Length` is wrong, by the rule a
+    /// lenient load uses: the data ends at the only `endstream` before `bound` that follows an end
+    /// of line and is followed by `endobj`. The scan reads a chunk at a time, keeping a few bytes
+    /// of the last one so that a marker across two chunks is still seen.
+    fn recover_length(&mut self, data_at: u64, bound: u64) -> Result<u64> {
+        const MARKER: &[u8] = b"endstream";
+        // Two bytes of end of line before the marker.
+        const CARRY: usize = MARKER.len() + 1;
+
+        let mut found = None;
+        let mut window_at = data_at;
+        while window_at < bound {
+            let size = ((bound - window_at) as usize).min(CHUNK);
+            let window = self.source.window(window_at, size)?;
+            for (at, candidate) in window.windows(MARKER.len()).enumerate() {
+                if candidate != MARKER {
+                    continue;
+                }
+                let marker_at = window_at + at as u64;
+                let Some(data_end) = self.data_end_before(data_at, marker_at, bound)? else {
+                    continue;
+                };
+                if found.is_some_and(|end| end != data_end) {
+                    return Err(fallback(StripFallback::LengthMismatch));
+                }
+                found = Some(data_end);
+            }
+            if window_at + size as u64 >= bound {
+                break;
+            }
+            // Step back over the bytes a marker split across this chunk and the next may need.
+            window_at += (size - CARRY.min(size)).max(1) as u64;
         }
-        Ok(())
+
+        let data_end = found.ok_or(fallback(StripFallback::LengthMismatch))?;
+        Ok(data_end - data_at)
+    }
+
+    /// Where the data ends if the `endstream` at `marker_at` closes the stream: after an end of
+    /// line, and followed by `endobj` and then white space or `bound`. `None` otherwise.
+    fn data_end_before(&mut self, data_at: u64, marker_at: u64, bound: u64) -> Result<Option<u64>> {
+        let before_at = marker_at.saturating_sub(2).max(data_at);
+        let before = self.source.window(before_at, (marker_at - before_at) as usize)?;
+        let data_end = if before.ends_with(b"\r\n") {
+            marker_at - 2
+        } else if before.ends_with(b"\n") || before.ends_with(b"\r") {
+            marker_at - 1
+        } else {
+            return Ok(None);
+        };
+
+        let after_at = marker_at + 9;
+        let after = self
+            .source
+            .window(after_at, (bound.saturating_sub(after_at) as usize).min(64))?;
+        let rest = &after[after.iter().take_while(|byte| b" \t\r\n\x0C\0".contains(byte)).count()..];
+        let ends_object = rest
+            .strip_prefix(b"endobj")
+            .is_some_and(|tail| tail.first().is_none_or(|byte| b" \t\r\n\x0C\0".contains(byte)));
+        Ok(ends_object.then_some(data_end))
     }
 
     fn resolve_length(&mut self, length: Option<&Object>) -> Result<u64> {
@@ -684,7 +785,7 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
 /// The most form fields [`Stripper::signed`] looks at before answering [`Signed::Unknown`].
 const MAX_FIELDS: usize = 10_000;
 
-impl<R: Read + Seek, W: Write> Stripper<R, W> {
+impl<'o, R: Read + Seek, W: Write> Stripper<'o, R, W> {
     /// Whether the file holds a signature: a `/FT /Sig` field with a `/V` under the catalog's
     /// `/AcroForm /Fields`, `/FT` inherited down `/Kids`. An unsigned signature field is not one.
     /// Any object that cannot be read, or more than [`MAX_FIELDS`] fields, gives `Unknown`.
@@ -741,16 +842,26 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
     }
 
     /// Whether the catalog's `/Perms` holds a usage-rights signature, `/UR3` or the older `/UR`.
-    fn usage_rights(&mut self) -> bool {
-        let perms = (|| {
-            let root = self.index.trailer.get(b"Root")?.clone();
-            let perms = self.resolve(&root)?.as_dict()?.get(b"Perms")?.clone();
-            self.resolve(&perms)
-        })();
-        perms
-            .ok()
-            .and_then(|perms| perms.as_dict().ok().map(|perms| perms.has(b"UR3") || perms.has(b"UR")))
-            .unwrap_or(false)
+    /// `No` only when the catalog was read and has none: a catalog or `/Perms` that cannot be read
+    /// is `Unknown`, never taken for absent.
+    fn usage_rights(&mut self) -> UsageRights {
+        let Ok(root) = self.index.trailer.get(b"Root").cloned() else {
+            return UsageRights::Unknown;
+        };
+        let Ok(root) = self.resolve(&root) else {
+            return UsageRights::Unknown;
+        };
+        let Ok(root) = root.as_dict() else {
+            return UsageRights::Unknown;
+        };
+        let Ok(perms) = root.get(b"Perms").cloned() else {
+            return UsageRights::No;
+        };
+        match self.resolve(&perms) {
+            Ok(Object::Dictionary(perms)) if perms.has(b"UR3") || perms.has(b"UR") => UsageRights::Yes,
+            Ok(Object::Dictionary(_)) => UsageRights::No,
+            _ => UsageRights::Unknown,
+        }
     }
 
     fn resolve(&mut self, object: &Object) -> Result<Object> {
@@ -970,6 +1081,7 @@ mod tests {
             &mut output,
             &StripOptions::with_password("user"),
             caps,
+            &mut crate::strip::Unobserved,
         )?;
         Ok(output)
     }
@@ -1054,16 +1166,69 @@ mod tests {
 
     #[test]
     fn inspect_reads_a_catalog_in_an_object_stream_only_with_the_key() {
-        use crate::strip::{PasswordCheck, Signed};
+        use crate::strip::{PasswordCheck, Signed, UsageRights};
 
         let bytes = object_stream_file();
         let opened = super::inspect(Cursor::new(&bytes), Some("user"), &Caps::default()).unwrap();
         assert_eq!(opened.password, PasswordCheck::User);
         assert_eq!(opened.signed, Signed::No, "the catalog has no /AcroForm");
+        assert_eq!(opened.usage_rights, UsageRights::No, "nor /Perms");
 
         // Without the key the object stream is ciphertext, never read as plaintext.
         let locked = super::inspect(Cursor::new(&bytes), Some("wrong"), &Caps::default()).unwrap();
         assert_eq!(locked.password, PasswordCheck::Wrong);
         assert_eq!(locked.signed, Signed::Unknown);
+        assert_eq!(
+            locked.usage_rights,
+            UsageRights::Unknown,
+            "an unread catalog is never taken for one without"
+        );
+    }
+
+    /// What an observer saw: each event's name and bytes, a stream's data joined, since the two
+    /// sides may cut it differently.
+    #[derive(Debug, Default, PartialEq)]
+    struct Recorder(Vec<(String, Vec<u8>)>);
+
+    impl crate::strip::StripObserver for Recorder {
+        fn object(&mut self, id: crate::ObjectId) {
+            self.0.push((format!("object {id:?}"), Vec::new()));
+        }
+        fn string(&mut self, plaintext: &[u8]) {
+            self.0.push(("string".to_string(), plaintext.to_vec()));
+        }
+        fn stream(&mut self, length: u64) {
+            self.0.push((format!("stream {length}"), Vec::new()));
+        }
+        fn stream_data(&mut self, plaintext: &[u8]) {
+            self.0.last_mut().unwrap().1.extend_from_slice(plaintext);
+        }
+    }
+
+    #[test]
+    fn an_object_stream_file_reads_back_as_it_was_written() {
+        let mut written = Recorder::default();
+        let mut output = Vec::new();
+        strip(
+            Cursor::new(object_stream_file()),
+            &mut output,
+            &StripOptions::with_password("user"),
+            &Caps::default(),
+            &mut written,
+        )
+        .unwrap();
+        // The object stream and the content stream, which also has an indirect /Length.
+        assert_eq!(
+            written
+                .0
+                .iter()
+                .filter(|(event, _)| event.starts_with("stream"))
+                .count(),
+            2
+        );
+
+        let mut read = Recorder::default();
+        crate::strip::verify::verify(Cursor::new(&output), &mut read, &Caps::default()).unwrap();
+        assert_eq!(read, written);
     }
 }
