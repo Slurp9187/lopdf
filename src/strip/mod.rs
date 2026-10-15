@@ -116,9 +116,8 @@ pub struct Inspection {
     /// Whether the file holds a signature a Strip would invalidate.
     pub signed: Signed,
     /// Whether the catalog's `/Perms` holds a usage-rights signature (`/UR3`, or the older `/UR`),
-    /// which a Strip invalidates too. It is not a form field, so it is not in [`Self::signed`]. False
-    /// also when the catalog cannot be read; `signed` is then [`Signed::Unknown`].
-    pub usage_rights: bool,
+    /// which a Strip invalidates too. It is not a form field, so it is not in [`Self::signed`].
+    pub usage_rights: UsageRights,
     /// Why the streaming Strip would need the whole-document path, when that is known up front. A
     /// [`strip`] can still find a reason later, in a stream it reads.
     pub needs_whole_document: Option<StripFallback>,
@@ -136,6 +135,18 @@ pub enum PasswordCheck {
     Owner,
     /// Neither. A file whose user password is empty still opens without it.
     Wrong,
+}
+
+/// Whether a file holds a usage-rights signature, from [`inspect`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UsageRights {
+    /// The catalog's `/Perms` has `/UR3` or `/UR`.
+    Yes,
+    /// The catalog was read, and it has neither.
+    No,
+    /// The catalog or its `/Perms` could not be read: treat the file as having one.
+    Unknown,
 }
 
 /// Whether a file is signed, from [`inspect`].
