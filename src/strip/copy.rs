@@ -1032,4 +1032,19 @@ mod tests {
             Err(Error::NeedsWholeDocument(StripFallback::BadObjectStream))
         ));
     }
+
+    #[test]
+    fn inspect_reads_a_catalog_in_an_object_stream_only_with_the_key() {
+        use crate::strip::{PasswordCheck, Signed};
+
+        let bytes = object_stream_file();
+        let opened = super::inspect(Cursor::new(&bytes), Some("user"), &Caps::default()).unwrap();
+        assert_eq!(opened.password, PasswordCheck::User);
+        assert_eq!(opened.signed, Signed::No, "the catalog has no /AcroForm");
+
+        // Without the key the object stream is ciphertext, never read as plaintext.
+        let locked = super::inspect(Cursor::new(&bytes), Some("wrong"), &Caps::default()).unwrap();
+        assert_eq!(locked.password, PasswordCheck::Wrong);
+        assert_eq!(locked.signed, Signed::Unknown);
+    }
 }
