@@ -538,7 +538,6 @@ fn _indirect_object<'a>(
 
 /// What follows an indirect object's `N G obj` header, as [`object_head`] reads it.
 #[derive(Debug)]
-#[cfg_attr(not(test), expect(dead_code, reason = "used by strip() from S5 on"))]
 pub(crate) enum ObjectHead {
     /// A direct object, and the window offset just past its `endobj` (or past the object, when the
     /// window ends the file without one).
@@ -556,7 +555,6 @@ pub(crate) enum ObjectHead {
 /// follows `stream` (`\r` alone could be the start of `\r\n`). Unless `at_eof` says the window
 /// ends the file, `None` means the window is too short or the object is malformed; the caller
 /// tries a longer window, up to its cap.
-#[cfg_attr(not(test), expect(dead_code, reason = "used by strip() from S5 on"))]
 pub(crate) fn object_head(window: &[u8], at_eof: bool) -> Option<(ObjectId, ObjectHead)> {
     let (rest, (_, id)) = terminated((space, object_id), pair(tag(&b"obj"[..]), space))
         .parse(window)
