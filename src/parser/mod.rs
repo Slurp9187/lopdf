@@ -536,6 +536,60 @@ fn _indirect_object<'a>(
     Ok((object_id, object))
 }
 
+/// What follows an indirect object's `N G obj` header, as [`object_head`] reads it.
+#[derive(Debug)]
+#[cfg_attr(not(test), expect(dead_code, reason = "used by strip() from S5 on"))]
+pub(crate) enum ObjectHead {
+    /// A direct object, and the window offset just past its `endobj` (or past the object, when the
+    /// window ends the file without one).
+    Direct { object: Object, end: usize },
+    /// A stream's dictionary, and the window offset where its data starts.
+    Stream { dict: Dictionary, data_start: usize },
+}
+
+/// Parses `N G obj` and the object or stream dictionary that follows from `window`, the bytes at an
+/// object's offset, without a `Reader`: a stream's `/Length` is left to the caller.
+///
+/// The parsers accept the end of the input as the end of a token, so a window cut at `12` in the
+/// middle of `123` would parse cleanly as 12. A result is therefore accepted only when what ends
+/// it lies inside the window: `endobj` after a direct object, or a byte after the end of line that
+/// follows `stream` (`\r` alone could be the start of `\r\n`). Unless `at_eof` says the window
+/// ends the file, `None` means the window is too short or the object is malformed; the caller
+/// tries a longer window, up to its cap.
+#[cfg_attr(not(test), expect(dead_code, reason = "used by strip() from S5 on"))]
+pub(crate) fn object_head(window: &[u8], at_eof: bool) -> Option<(ObjectId, ObjectHead)> {
+    let (rest, (_, id)) = terminated((space, object_id), pair(tag(&b"obj"[..]), space))
+        .parse(window)
+        .ok()?;
+
+    if let Ok((data, dict)) = terminated(dictionary, (space, tag(&b"stream"[..]), space0, eol)).parse(rest) {
+        if data.is_empty() && !at_eof {
+            return None;
+        }
+        let data_start = window.len() - data.len();
+        return Some((id, ObjectHead::Stream { dict, data_start }));
+    }
+
+    let (after, object) = _direct_object(crate::reader::MAX_NESTING_DEPTH)(rest).ok()?;
+    match terminated(tag(&b"endobj"[..]), space).parse(after) {
+        Ok((tail, _)) => Some((
+            id,
+            ObjectHead::Direct {
+                object,
+                end: window.len() - tail.len(),
+            },
+        )),
+        Err(_) if at_eof => Some((
+            id,
+            ObjectHead::Direct {
+                object,
+                end: window.len() - after.len(),
+            },
+        )),
+        Err(_) => None,
+    }
+}
+
 pub fn header(input: ParserInput, strict: bool) -> Option<String> {
     // Parse the version digits separately from trailing bytes: some generators put binary
     // markers on the header line. Strict mode rejects them, lenient mode skips them.
@@ -938,6 +992,72 @@ mod tests {
 
     fn test_span(s: &'_ [u8]) -> ParserInput<'_> {
         s
+    }
+
+    #[test]
+    fn object_head_reads_a_direct_object_up_to_endobj() {
+        let window = b"12 0 obj\n<< /Type /Font /Name (x) >>\nendobj\n13 0 obj";
+        let Some((id, ObjectHead::Direct { object, end })) = object_head(window, false) else {
+            panic!("expected a direct object");
+        };
+        assert_eq!(id, (12, 0));
+        assert!(object.as_dict().unwrap().has_type(b"Font"));
+        assert_eq!(&window[end..], b"13 0 obj");
+    }
+
+    #[test]
+    fn object_head_waits_for_endobj_rather_than_trusting_a_cut_token() {
+        // `123` cut after `12` parses as 12 unless the window must also hold `endobj`.
+        let full = b"7 0 obj\n123\nendobj\n";
+        assert!(object_head(&full[..10], false).is_none());
+        let Some((_, ObjectHead::Direct { object, .. })) = object_head(full, false) else {
+            panic!("expected a direct object");
+        };
+        assert_eq!(object.as_i64().unwrap(), 123);
+
+        // At the end of the file, a missing `endobj` is tolerated.
+        let Some((_, ObjectHead::Direct { object, end })) = object_head(&full[..11], true) else {
+            panic!("expected a direct object at the end of the file");
+        };
+        assert_eq!(object.as_i64().unwrap(), 123);
+        assert_eq!(end, 11);
+    }
+
+    #[test]
+    fn object_head_finds_where_stream_data_starts() {
+        for (eol, data_start) in [(&b"\n"[..], 31), (&b"\r\n"[..], 32)] {
+            let mut window = b"5 0 obj\n<< /Length 4 >>\nstream".to_vec();
+            window.extend_from_slice(eol);
+            window.extend_from_slice(b"DATA\nendstream\nendobj\n");
+            let Some((
+                id,
+                ObjectHead::Stream {
+                    dict,
+                    data_start: found,
+                },
+            )) = object_head(&window, false)
+            else {
+                panic!("expected a stream");
+            };
+            assert_eq!(id, (5, 0));
+            assert_eq!(dict.get(b"Length").unwrap().as_i64().unwrap(), 4);
+            assert_eq!(found, data_start, "{eol:?}");
+            assert_eq!(&window[found..found + 4], b"DATA");
+        }
+    }
+
+    #[test]
+    fn object_head_does_not_guess_the_end_of_line_after_stream() {
+        // A window that ends right after `stream\r` could be cutting `\r\n` in two.
+        let window = b"5 0 obj\n<< /Length 4 >>\nstream\r";
+        assert!(object_head(window, false).is_none());
+        assert!(object_head(b"5 0 obj\n<< /Length 4 >>\nstream", false).is_none());
+    }
+
+    #[test]
+    fn object_head_rejects_what_is_not_an_object() {
+        assert!(object_head(b"xref\n0 1\n", true).is_none());
+        assert!(object_head(b"5 0 obj\n<< /Unclosed ", true).is_none());
     }
 
     /// The in-use entries of `xref`; free entries, object 0 among them, are recorded too.
