@@ -1,6 +1,7 @@
 use super::DecryptionError;
 use super::pkcs5::Pkcs5;
 use super::rc4::Rc4;
+use super::stream::{AesCbcDecipher, ChunkDecipher, IdentityDecipher, Rc4Decipher};
 use crate::ObjectId;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use md5::{Digest as _, Md5};
@@ -18,6 +19,13 @@ pub trait CryptFilter: std::fmt::Debug + Send + Sync {
     fn compute_key(&self, key: &[u8], obj_id: ObjectId) -> Result<Vec<u8>, DecryptionError>;
     fn encrypt(&self, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, DecryptionError>;
     fn decrypt(&self, key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, DecryptionError>;
+
+    /// A decipher for one object's stream data, fed a chunk at a time, keyed with the object's
+    /// `key` from [`compute_key`](Self::compute_key). `None` means this filter can only decrypt a
+    /// whole buffer.
+    fn chunked_decrypt(&self, _key: &[u8]) -> Result<Option<Box<dyn ChunkDecipher>>, DecryptionError> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -38,6 +46,10 @@ impl CryptFilter for IdentityCryptFilter {
 
     fn decrypt(&self, _key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, DecryptionError> {
         Ok(ciphertext.to_vec())
+    }
+
+    fn chunked_decrypt(&self, _key: &[u8]) -> Result<Option<Box<dyn ChunkDecipher>>, DecryptionError> {
+        Ok(Some(Box::new(IdentityDecipher)))
     }
 }
 
@@ -82,6 +94,10 @@ impl CryptFilter for Rc4CryptFilter {
 
     fn decrypt(&self, key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, DecryptionError> {
         Ok(Rc4::new(key).decrypt(ciphertext))
+    }
+
+    fn chunked_decrypt(&self, key: &[u8]) -> Result<Option<Box<dyn ChunkDecipher>>, DecryptionError> {
+        Ok(Some(Box::new(Rc4Decipher::new(Rc4::new(key).keystream()))))
     }
 }
 
@@ -161,6 +177,10 @@ macro_rules! aes_cbc_crypt_filter {
                 data.truncate(plaintext_len);
 
                 Ok(std::mem::take(&mut *data))
+            }
+
+            fn chunked_decrypt(&self, key: &[u8]) -> Result<Option<Box<dyn ChunkDecipher>>, DecryptionError> {
+                Ok(Some(Box::new(AesCbcDecipher::<$dec>::new(key)?)))
             }
         }
     };
