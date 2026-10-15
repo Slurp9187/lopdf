@@ -45,15 +45,15 @@ fn rc4_rounds(mut data: Vec<u8>, file_key: &[u8], rounds: impl IntoIterator<Item
 /// the spec's "no padding, whole blocks" AES uses in Algorithms 2.B, 8, 9, 10
 /// and 13 all behave. The key is always 32 bytes: either the file encryption key
 /// or an Algorithm 2.B hash.
-fn aes256_cbc(data: &mut [u8], key: [u8; 32], encrypt: bool) {
+fn aes256_cbc(data: &mut [u8], key: &[u8; 32], encrypt: bool) {
     let iv = [0u8; 16];
     if encrypt {
-        let mut cipher = Aes256CbcEnc::new(&key.into(), &iv.into());
+        let mut cipher = Aes256CbcEnc::new(key.into(), &iv.into());
         for block in data.as_chunks_mut::<16>().0 {
             cipher.encrypt_block(aes_block_mut(block));
         }
     } else {
-        let mut cipher = Aes256CbcDec::new(&key.into(), &iv.into());
+        let mut cipher = Aes256CbcDec::new(key.into(), &iv.into());
         for block in data.as_chunks_mut::<16>().0 {
             cipher.decrypt_block(aes_block_mut(block));
         }
@@ -62,23 +62,24 @@ fn aes256_cbc(data: &mut [u8], key: [u8; 32], encrypt: bool) {
 
 /// The AES-256-ECB counterpart of [`aes256_cbc`], used for the 16-byte
 /// `/Perms` block of Algorithms 10 and 13.
-fn aes256_ecb(data: &mut [u8; 16], key: [u8; 32], encrypt: bool) {
+fn aes256_ecb(data: &mut [u8; 16], key: &[u8; 32], encrypt: bool) {
     if encrypt {
-        let mut cipher = Aes256EbcEnc::new(&key.into());
+        let mut cipher = Aes256EbcEnc::new(key.into());
         for block in data.as_chunks_mut::<16>().0 {
             cipher.encrypt_block(aes_block_mut(block));
         }
     } else {
-        let mut cipher = Aes256EbcDec::new(&key.into());
+        let mut cipher = Aes256EbcDec::new(key.into());
         for block in data.as_chunks_mut::<16>().0 {
             cipher.decrypt_block(aes_block_mut(block));
         }
     }
 }
 
-/// Reinterpret a 32-byte Algorithm 2.B hash as the AES-256 key it is.
-fn aes256_key(hash: &[u8]) -> [u8; 32] {
-    let mut key = [0u8; 32];
+/// Reinterpret a 32-byte Algorithm 2.B hash, or the file encryption key, as the AES-256 key it
+/// is. The copy is wiped on drop.
+fn aes256_key(hash: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(hash);
     key
 }
@@ -111,14 +112,23 @@ const PAD_BYTES: [u8; 32] = [
 ];
 
 /// Truncate or pad `password` to exactly 32 bytes, filling from the start of
-/// `PAD_BYTES` (ISO 32000-1, 7.6.3.3 step 2).
-fn padded_password(password: &[u8]) -> [u8; 32] {
+/// `PAD_BYTES` (ISO 32000-1, 7.6.3.3 step 2). The copy is wiped on drop.
+fn padded_password(password: &[u8]) -> Zeroizing<[u8; 32]> {
     let len = password.len().min(32);
-    let mut bytes = [0u8; 32];
+    let mut bytes = Zeroizing::new([0u8; 32]);
 
     bytes[..len].copy_from_slice(&password[..len]);
     bytes[len..].copy_from_slice(&PAD_BYTES[..32 - len]);
 
+    bytes
+}
+
+/// `digest` as a vector that is wiped on drop, wiping the digest too: a hash on the stack that a
+/// key is cut from is key material itself. Truncating the result is safe, as the whole capacity
+/// is wiped.
+fn take_digest(digest: &mut [u8]) -> Zeroizing<Vec<u8>> {
+    let bytes = Zeroizing::new(digest.to_vec());
+    digest.zeroize();
     bytes
 }
 
@@ -144,7 +154,7 @@ fn md5_key_length(algorithm: &PasswordAlgorithm) -> Result<usize, DecryptionErro
 /// the resulting key to.
 fn hash_padded_password(algorithm: &PasswordAlgorithm, password: &[u8]) -> Result<Zeroizing<Vec<u8>>, DecryptionError> {
     let mut hasher = Md5::new();
-    hasher.update(padded_password(password));
+    hasher.update(padded_password(password).as_slice());
 
     let mut hash = hasher.finalize();
 
@@ -158,7 +168,10 @@ fn hash_padded_password(algorithm: &PasswordAlgorithm, password: &[u8]) -> Resul
 
     let n = md5_key_length(algorithm)?;
 
-    Ok(Zeroizing::new(hash[..n].to_vec()))
+    let mut key = take_digest(&mut hash);
+    key.truncate(n);
+
+    Ok(key)
 }
 
 /// Normalize an `/O` or `/U` value in place against the document's revision: 32
@@ -177,7 +190,7 @@ fn normalize_r5_value(value: &mut Vec<u8>, revision: i64) -> Result<(), Decrypti
     Ok(())
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct PasswordAlgorithm {
     pub(crate) encrypt_metadata: bool,
     pub(crate) length: Option<usize>,
@@ -189,6 +202,25 @@ pub struct PasswordAlgorithm {
     pub(crate) user_encrypted: Vec<u8>,
     pub(crate) permissions: Permissions,
     pub(crate) permission_encrypted: Vec<u8>,
+}
+
+impl std::fmt::Debug for PasswordAlgorithm {
+    /// Redacts the password-derived `/O`, `/U`, `/OE`, `/UE` and `/Perms` values, as
+    /// `EncryptionState`'s `Debug` does.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordAlgorithm")
+            .field("encrypt_metadata", &self.encrypt_metadata)
+            .field("length", &self.length)
+            .field("version", &self.version)
+            .field("revision", &self.revision)
+            .field("owner_value", &"[REDACTED]")
+            .field("owner_encrypted", &"[REDACTED]")
+            .field("user_value", &"[REDACTED]")
+            .field("user_encrypted", &"[REDACTED]")
+            .field("permissions", &self.permissions)
+            .field("permission_encrypted", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl TryFrom<&Document> for PasswordAlgorithm {
@@ -408,7 +440,7 @@ impl PasswordAlgorithm {
         // Initialize the MD5 hash function and pass the result as input to this function.
         let mut hasher = Md5::new();
 
-        hasher.update(padded_password(password));
+        hasher.update(padded_password(password).as_slice());
 
         // Pass the value of the encryption dictionary's O entry (owner password hash) to the MD5 hash
         // function.
@@ -440,7 +472,10 @@ impl PasswordAlgorithm {
         }
 
         // The key is the first n bytes of the final digest (n = 5 for R2, else /Length / 8).
-        Ok(Zeroizing::new(hash[..n].to_vec()))
+        let mut key = take_digest(&mut hash);
+        key.truncate(n);
+
+        Ok(key)
     }
 
     /// Sanitize the password (revision 6 and later).
@@ -482,7 +517,7 @@ impl PasswordAlgorithm {
 
             // Decrypt /OE with AES-256 CBC, zero IV, no padding: the result is the file key.
             let mut owner_encrypted = Zeroizing::new(self.owner_encrypted.clone());
-            aes256_cbc(&mut owner_encrypted, key, false);
+            aes256_cbc(&mut owner_encrypted, &key, false);
 
             return Ok(owner_encrypted);
         }
@@ -495,7 +530,7 @@ impl PasswordAlgorithm {
 
             // Decrypt /UE with AES-256 CBC, zero IV, no padding: the result is the file key.
             let mut user_encrypted = Zeroizing::new(self.user_encrypted.clone());
-            aes256_cbc(&mut user_encrypted, key, false);
+            aes256_cbc(&mut user_encrypted, &key, false);
 
             // Algorithm 13: /Perms must decrypt to "adb" at bytes 9-11 with permissions equal to P.
             self.validate_permissions(&user_encrypted)?;
@@ -530,7 +565,8 @@ impl PasswordAlgorithm {
             hasher.update(user_key);
         }
 
-        let mut k = Zeroizing::new(hasher.finalize().to_vec());
+        let mut digest = hasher.finalize();
+        let mut k = take_digest(&mut digest);
 
         // Revision 5 uses a simplified hash algorithm that simply calculates the SHA-256 hash of
         // the original input to the algorithm.
@@ -574,12 +610,21 @@ impl PasswordAlgorithm {
             let e = k1;
 
             // Pick the next hash (SHA-256/384/256) by E[0..16] mod 3; it becomes the new K.
-            k = Zeroizing::new(match e[..16].iter().map(|v| *v as u32).sum::<u32>() % 3 {
-                0 => Sha256::digest(&*e).to_vec(),
-                1 => Sha384::digest(&*e).to_vec(),
-                2 => Sha512::digest(&*e).to_vec(),
+            k = match e[..16].iter().map(|v| *v as u32).sum::<u32>() % 3 {
+                0 => {
+                    let mut digest = Sha256::digest(&*e);
+                    take_digest(&mut digest)
+                }
+                1 => {
+                    let mut digest = Sha384::digest(&*e);
+                    take_digest(&mut digest)
+                }
+                2 => {
+                    let mut digest = Sha512::digest(&*e);
+                    take_digest(&mut digest)
+                }
                 _ => unreachable!(),
-            });
+            };
 
             // Repeat the round while E's last byte is greater than round - 32.
             if round >= 64 && e.last().copied().unwrap_or(0) as u32 <= round - 32 {
@@ -621,7 +666,7 @@ impl PasswordAlgorithm {
 
         // Encrypt the result of the previous step using an RC4 encryption function with the RC4 file
         // encryption key obtained in the step before the previous step.
-        let mut result = Rc4::new(&hash).encrypt(padded_password(user_password));
+        let mut result = Rc4::new(&hash).encrypt(padded_password(user_password).as_slice());
 
         // Revision 3+: 19 RC4 rounds, each key being the file key XORed with the counter byte
         // (1 to 19).
@@ -847,7 +892,7 @@ impl PasswordAlgorithm {
         let key = aes256_key(&self.compute_hash(password, key_salt, user_key)?);
 
         let mut encrypted = file_encryption_key.to_vec();
-        aes256_cbc(&mut encrypted, key, true);
+        aes256_cbc(&mut encrypted, &key, true);
 
         Ok((value.to_vec(), encrypted))
     }
@@ -877,7 +922,7 @@ impl PasswordAlgorithm {
 
         // Encrypt the 16-byte block using AES-256 in ECB mode with an initialization vector of
         // zero, using the file encryption key as the key.
-        aes256_ecb(&mut bytes, aes256_key(file_encryption_key), true);
+        aes256_ecb(&mut bytes, &aes256_key(file_encryption_key), true);
 
         // The result (16 bytes) is stored as the Perms string, and checked for validity when the
         // file is opened.
@@ -934,7 +979,7 @@ impl PasswordAlgorithm {
         // of zero and the file encryption key as the key.
         let mut bytes = [0u8; 16];
         bytes.copy_from_slice(&self.permission_encrypted);
-        aes256_ecb(&mut bytes, aes256_key(file_encryption_key), false);
+        aes256_ecb(&mut bytes, &aes256_key(file_encryption_key), false);
 
         // Verify that bytes 9-11 of the result are the characters "a", "d", "b".
         if &bytes[9..][..3] != b"adb" {

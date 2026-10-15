@@ -7,7 +7,7 @@ use lopdf::encryption::crypt_filters::{Aes256CryptFilter, CryptFilter};
 use lopdf::{Document, EncryptionState, EncryptionVersion, Object, Permissions, Stream, dictionary};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 struct WatchingAllocator;
@@ -22,6 +22,13 @@ const NOT_WIPED: u8 = 2;
 
 /// The watch is global, so the tests take turns.
 static SERIAL: Mutex<()> = Mutex::new(());
+
+/// While set, every freed allocation is searched for `MARKER`, for buffers a test cannot reach.
+static SCANNING: AtomicBool = AtomicBool::new(false);
+/// Whether a freed allocation still held `MARKER` while scanning.
+static MARKER_FREED: AtomicBool = AtomicBool::new(false);
+/// Plaintext no other allocation in the test binary holds.
+const MARKER: &[u8; 32] = b"plaintext marker 7f3a9c1e5b2d804";
 
 unsafe impl GlobalAlloc for WatchingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -44,6 +51,12 @@ unsafe impl GlobalAlloc for WatchingAllocator {
                 NOT_WIPED
             };
             OUTCOME.store(outcome, Ordering::SeqCst);
+        }
+        if SCANNING.load(Ordering::SeqCst) {
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
+            if bytes.windows(MARKER.len()).any(|window| window == MARKER) {
+                MARKER_FREED.store(true, Ordering::SeqCst);
+            }
         }
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -146,6 +159,53 @@ fn a_decrypted_document_wipes_its_key_when_it_drops() {
     assert_eq!(state.file_encryption_key(), FILE_KEY);
     let key = state.file_encryption_key().as_ptr();
     assert_wiped_when(key, "the document's key", || drop(doc));
+}
+
+/// Runs `f` and asserts that no allocation freed meanwhile still held `MARKER`.
+fn assert_marker_never_freed(what: &str, f: impl FnOnce()) {
+    MARKER_FREED.store(false, Ordering::SeqCst);
+    SCANNING.store(true, Ordering::SeqCst);
+    f();
+    SCANNING.store(false, Ordering::SeqCst);
+    assert!(
+        !MARKER_FREED.load(Ordering::SeqCst),
+        "{what} freed the plaintext without wiping it"
+    );
+}
+
+#[test]
+fn aes_decryption_leaves_no_unwiped_plaintext_behind() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let key = [0x5Au8; 32];
+    let ciphertext = Aes256CryptFilter.encrypt(&key, MARKER).unwrap();
+
+    // The caller wipes the plaintext it gets back; nothing else may hold a copy.
+    assert_marker_never_freed("AES decryption", || {
+        let plaintext = zeroize::Zeroizing::new(Aes256CryptFilter.decrypt(&key, &ciphertext).unwrap());
+        assert_eq!(plaintext.as_slice(), MARKER);
+    });
+}
+
+#[test]
+fn the_password_algorithms_debug_hides_the_password_values() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut doc = document();
+    doc.encrypt(&v5_state()).unwrap();
+
+    let algorithm = lopdf::encryption::PasswordAlgorithm::try_from(&doc).unwrap();
+    let debug = format!("{algorithm:?}");
+    for key in [
+        "owner_value",
+        "owner_encrypted",
+        "user_value",
+        "user_encrypted",
+        "permission_encrypted",
+    ] {
+        assert!(
+            debug.contains(&format!("{key}: \"[REDACTED]\"")),
+            "{key} is shown: {debug}"
+        );
+    }
 }
 
 /// The password handed to a loader is wiped once the reader is done with it,
