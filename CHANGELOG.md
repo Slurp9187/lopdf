@@ -1,4 +1,8 @@
 
+<a name="unreleased"></a>
+## [Unreleased](https://github.com/J-F-Liu/lopdf/compare/v0.45.0...HEAD)
+* Encrypt and decrypt the strings in a stream's dictionary, such as an embedded file's `/Params /CheckSum` and `/ModDate`, which were left in the clear on encryption and as ciphertext on decryption
+
 <a name="v0.45.0"></a>
 ## [v0.45.0](https://github.com/J-F-Liu/lopdf/compare/v0.44.0...v0.45.0) (2026-09-08)
 * Accept 19-byte cross-reference entries when parsing leniently ([#564](https://github.com/J-F-Liu/lopdf/issues/564))

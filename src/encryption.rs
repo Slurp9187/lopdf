@@ -771,6 +771,14 @@ fn transform_object(
                 .unwrap_or(Arc::new(IdentityCryptFilter))
         });
 
+    // A stream's dictionary is covered too: its strings, such as an embedded file's
+    // /Params /CheckSum or /ModDate, are encrypted like any other string (ISO 32000-1, 7.6.2).
+    if let Object::Stream(stream) = obj {
+        for (_, value) in stream.dict.iter_mut() {
+            transform_object(state, obj_id, value, direction)?;
+        }
+    }
+
     // Retrieve the payload and the crypt filter to use to transform it.
     let (mut crypt_filter, payload) = match obj {
         // Every string and stream is covered, so recurse into arrays and dictionaries
