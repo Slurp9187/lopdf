@@ -8,6 +8,7 @@
 mod copy;
 mod index;
 mod source;
+mod verify;
 
 use crate::Result;
 use std::fmt;
@@ -31,7 +32,65 @@ use zeroize::Zeroizing;
 /// hold a partial file, which the caller discards. A file that is not encrypted is
 /// [`Error::NotEncrypted`](crate::Error::NotEncrypted).
 pub fn strip<R: Read + Seek, W: Write>(input: R, output: W, options: &StripOptions) -> Result<StripReport> {
-    copy::strip(input, output, options, &Caps::default())
+    copy::strip(input, output, options, &Caps::default(), &mut Unobserved)
+}
+
+/// [`strip`], reporting the plaintext it writes to `observer`, object by object, in output order.
+/// Hash what it sees, then hash what [`verify_stripped`] sees in the written output: equal digests
+/// mean the output holds what was decrypted.
+pub fn strip_observed<R: Read + Seek, W: Write>(
+    input: R, output: W, options: &StripOptions, observer: &mut dyn StripObserver,
+) -> Result<StripReport> {
+    copy::strip(input, output, options, &Caps::default(), observer)
+}
+
+/// Re-reads a file [`strip_observed`] wrote, independently of the writer, and reports to `observer`
+/// what it finds, in the same order and the same events, so the two can be compared.
+///
+/// Fails if `written` cannot be read back: that is a failed check too.
+pub fn verify_stripped<R: Read + Seek>(written: R, observer: &mut dyn StripObserver) -> Result<()> {
+    verify::verify(written, observer, &Caps::default())
+}
+
+/// Sees the plaintext of each object a Strip writes, or that [`verify_stripped`] reads back. Events
+/// come in output order: [`object`](Self::object), then the object's strings, then, for a stream,
+/// [`stream`](Self::stream) and its data. Stream data may arrive in different pieces on the two
+/// sides; hash it as one run of bytes.
+///
+/// What it is shown is plaintext: wipe anything kept from it.
+pub trait StripObserver {
+    /// A new object, by its id.
+    fn object(&mut self, id: crate::ObjectId);
+    /// One of the object's strings, decrypted, in the order a walk of the object meets them.
+    fn string(&mut self, plaintext: &[u8]);
+    /// The object is a stream of `length` bytes of (still-filtered) data.
+    fn stream(&mut self, length: u64);
+    /// The next piece of the stream's data.
+    fn stream_data(&mut self, plaintext: &[u8]);
+}
+
+/// An observer that sees nothing, for a plain [`strip`].
+pub(crate) struct Unobserved;
+
+impl StripObserver for Unobserved {
+    fn object(&mut self, _id: crate::ObjectId) {}
+    fn string(&mut self, _plaintext: &[u8]) {}
+    fn stream(&mut self, _length: u64) {}
+    fn stream_data(&mut self, _plaintext: &[u8]) {}
+}
+
+/// Reports every string in `object` to `observer`, in walk order.
+pub(crate) fn observe_strings(observer: &mut dyn StripObserver, object: &crate::Object) {
+    match object {
+        crate::Object::String(bytes, _) => observer.string(bytes),
+        crate::Object::Array(items) => items.iter().for_each(|item| observe_strings(observer, item)),
+        crate::Object::Dictionary(dict) => dict.iter().for_each(|(_, value)| observe_strings(observer, value)),
+        crate::Object::Stream(stream) => stream
+            .dict
+            .iter()
+            .for_each(|(_, value)| observe_strings(observer, value)),
+        _ => {}
+    }
 }
 
 /// Checks the PDF in `input` before a Strip, or for keeping it encrypted as it is: whether it is

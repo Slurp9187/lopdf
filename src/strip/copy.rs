@@ -3,7 +3,10 @@
 
 use super::index::{Index, read_index};
 use super::source::Source;
-use super::{Caps, Inspection, PasswordCheck, Signed, StripFallback, StripOptions, StripReport};
+use super::{
+    Caps, Inspection, PasswordCheck, Signed, StripFallback, StripObserver, StripOptions, StripReport, Unobserved,
+    observe_strings,
+};
 use crate::encryption::stream::{ChunkDecipher, IdentityDecipher, MAX_EXPANSION};
 use crate::encryption::{self, PasswordAlgorithm};
 use crate::parser::{self, ObjectHead};
@@ -27,7 +30,7 @@ fn fallback(reason: StripFallback) -> Error {
 
 /// Strips `input` into `output`. See [`super::strip`].
 pub(crate) fn strip<R: Read + Seek, W: Write>(
-    input: R, output: W, options: &StripOptions, caps: &Caps,
+    input: R, output: W, options: &StripOptions, caps: &Caps, observer: &mut dyn StripObserver,
 ) -> Result<StripReport> {
     let mut source = Source::new(input)?;
     let index = read_index(&mut source, caps)?;
@@ -48,7 +51,7 @@ pub(crate) fn strip<R: Read + Seek, W: Write>(
     };
     let state = decryption_state(&stand_in, password)?;
 
-    let mut stripper = Stripper::new(source, output, index, Some(state), caps);
+    let mut stripper = Stripper::new(source, output, index, Some(state), caps, observer);
     stripper.copy(&version, encrypt_id)?;
     Ok(stripper.report)
 }
@@ -101,7 +104,8 @@ pub(crate) fn inspect<R: Read + Seek>(input: R, password: Option<&str>, caps: &C
         }
     }
 
-    let mut stripper = Stripper::new(source, io::sink(), index, state, caps);
+    let mut unobserved = Unobserved;
+    let mut stripper = Stripper::new(source, io::sink(), index, state, caps, &mut unobserved);
     stripper.encrypted = encrypted;
     let signed = stripper.signed();
     let usage_rights = stripper.usage_rights();
@@ -254,7 +258,7 @@ struct Container {
     members: Vec<(u32, usize)>,
 }
 
-struct Stripper<R, W> {
+struct Stripper<'o, R, W> {
     source: Source<R>,
     out: Output<W>,
     index: Index,
@@ -272,10 +276,15 @@ struct Stripper<R, W> {
     input: Zeroizing<Vec<u8>>,
     output: Zeroizing<Vec<u8>>,
     report: StripReport,
+    /// Sees the plaintext of every object written.
+    observer: &'o mut dyn StripObserver,
 }
 
-impl<R: Read + Seek, W: Write> Stripper<R, W> {
-    fn new(source: Source<R>, output: W, index: Index, state: Option<EncryptionState>, caps: &Caps) -> Self {
+impl<'o, R: Read + Seek, W: Write> Stripper<'o, R, W> {
+    fn new(
+        source: Source<R>, output: W, index: Index, state: Option<EncryptionState>, caps: &Caps,
+        observer: &'o mut dyn StripObserver,
+    ) -> Self {
         Self {
             source,
             out: Output {
@@ -292,6 +301,7 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
             input: Zeroizing::new(vec![0; CHUNK]),
             output: Zeroizing::new(vec![0; CHUNK + MAX_EXPANSION]),
             report: StripReport::default(),
+            observer,
         }
     }
 
@@ -389,6 +399,7 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
             }
             ObjectHead::Direct { object, end } if !has_strings(&object) => {
                 // Nothing to decrypt: copy the bytes as they are.
+                self.observer.object(id);
                 let from = window.iter().take_while(|byte| byte.is_ascii_whitespace()).count();
                 self.out.write_all(&window[from..end])?;
                 if !window[..end].last().is_some_and(u8::is_ascii_whitespace) {
@@ -399,7 +410,11 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
                 let result = self
                     .state()
                     .and_then(|state| Ok(encryption::decrypt_object(state, id, &mut object)?))
-                    .and_then(|()| self.write_direct(id, &object));
+                    .and_then(|()| {
+                        self.observer.object(id);
+                        observe_strings(self.observer, &object);
+                        self.write_direct(id, &object)
+                    });
                 wipe_object(&mut object);
                 result?;
             }
@@ -453,6 +468,9 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
                     dict.set("Length", plaintext_len as i64);
                     remove_crypt_filter(dict);
                 }
+                self.observer.object(id);
+                observe_strings(self.observer, &dict);
+                self.observer.stream(plaintext_len as u64);
                 writeln!(self.out, "{} {} obj", id.0, id.1)?;
                 Writer::write_object(&mut self.out, &dict)?;
                 self.out.write_all(b"\nstream\n")?;
@@ -481,11 +499,13 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
             let n = (length - done).min(CHUNK as u64) as usize;
             self.source.read_into(data_at + done, &mut self.input[..n])?;
             let decrypted = decipher.update(&self.input[..n], &mut self.output)?;
+            self.observer.stream_data(&self.output[..decrypted]);
             self.out.write_all(&self.output[..decrypted])?;
             written += decrypted;
             done += n as u64;
         }
         let decrypted = decipher.finish(&mut self.output)?;
+        self.observer.stream_data(&self.output[..decrypted]);
         self.out.write_all(&self.output[..decrypted])?;
         Ok(written + decrypted)
     }
@@ -765,7 +785,7 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
 /// The most form fields [`Stripper::signed`] looks at before answering [`Signed::Unknown`].
 const MAX_FIELDS: usize = 10_000;
 
-impl<R: Read + Seek, W: Write> Stripper<R, W> {
+impl<'o, R: Read + Seek, W: Write> Stripper<'o, R, W> {
     /// Whether the file holds a signature: a `/FT /Sig` field with a `/V` under the catalog's
     /// `/AcroForm /Fields`, `/FT` inherited down `/Kids`. An unsigned signature field is not one.
     /// Any object that cannot be read, or more than [`MAX_FIELDS`] fields, gives `Unknown`.
@@ -1051,6 +1071,7 @@ mod tests {
             &mut output,
             &StripOptions::with_password("user"),
             caps,
+            &mut crate::strip::Unobserved,
         )?;
         Ok(output)
     }
@@ -1146,5 +1167,52 @@ mod tests {
         let locked = super::inspect(Cursor::new(&bytes), Some("wrong"), &Caps::default()).unwrap();
         assert_eq!(locked.password, PasswordCheck::Wrong);
         assert_eq!(locked.signed, Signed::Unknown);
+    }
+
+    /// What an observer saw: each event's name and bytes, a stream's data joined, since the two
+    /// sides may cut it differently.
+    #[derive(Debug, Default, PartialEq)]
+    struct Recorder(Vec<(String, Vec<u8>)>);
+
+    impl crate::strip::StripObserver for Recorder {
+        fn object(&mut self, id: crate::ObjectId) {
+            self.0.push((format!("object {id:?}"), Vec::new()));
+        }
+        fn string(&mut self, plaintext: &[u8]) {
+            self.0.push(("string".to_string(), plaintext.to_vec()));
+        }
+        fn stream(&mut self, length: u64) {
+            self.0.push((format!("stream {length}"), Vec::new()));
+        }
+        fn stream_data(&mut self, plaintext: &[u8]) {
+            self.0.last_mut().unwrap().1.extend_from_slice(plaintext);
+        }
+    }
+
+    #[test]
+    fn an_object_stream_file_reads_back_as_it_was_written() {
+        let mut written = Recorder::default();
+        let mut output = Vec::new();
+        strip(
+            Cursor::new(object_stream_file()),
+            &mut output,
+            &StripOptions::with_password("user"),
+            &Caps::default(),
+            &mut written,
+        )
+        .unwrap();
+        // The object stream and the content stream, which also has an indirect /Length.
+        assert_eq!(
+            written
+                .0
+                .iter()
+                .filter(|(event, _)| event.starts_with("stream"))
+                .count(),
+            2
+        );
+
+        let mut read = Recorder::default();
+        crate::strip::verify::verify(Cursor::new(&output), &mut read, &Caps::default()).unwrap();
+        assert_eq!(read, written);
     }
 }
