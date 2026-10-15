@@ -155,6 +155,20 @@ fn encrypted_document(mut doc: Document, version: &str) -> Document {
             key_length: 128,
             permissions: Permissions::all(),
         }),
+        // Streams stored as they are, strings in AES-128.
+        "Identity" => {
+            let aes: Arc<dyn CryptFilter> = Arc::new(Aes128CryptFilter);
+            EncryptionState::try_from(EncryptionVersion::V4 {
+                document: &doc,
+                encrypt_metadata: true,
+                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes)]),
+                stream_filter: b"Identity".to_vec(),
+                string_filter: b"StdCF".to_vec(),
+                owner_password: OWNER,
+                user_password: USER,
+                permissions: Permissions::all(),
+            })
+        }
         "AES-128" => {
             let aes: Arc<dyn CryptFilter> = Arc::new(Aes128CryptFilter);
             EncryptionState::try_from(EncryptionVersion::V4 {
@@ -247,15 +261,53 @@ fn an_unencrypted_file_is_refused() {
 }
 
 #[test]
-fn a_wrong_stream_length_needs_the_whole_document_path() {
-    let bytes = encrypted(document(1000), "RC4");
-    // RC4 keeps the length, so the content stream's /Length is 1000; make it 999.
-    let at = bytes.windows(13).position(|window| window == b"/Length 1000>").unwrap();
-    let mut damaged = bytes.clone();
-    damaged[at..at + 13].copy_from_slice(b"/Length  999>");
+fn a_wrong_stream_length_is_recovered_as_a_lenient_load_recovers_it() {
+    // RC4 keeps the length, so the content stream's /Length is its plaintext length. The longer
+    // streams end past the first 64 KiB the scan reads; at 131,067 bytes, `endstream` straddles the
+    // 128 KiB mark, where a scan that kept nothing of the previous chunk would split it.
+    for (content_len, found, wrong) in [
+        (1000, &b"/Length 1000>"[..], &b"/Length  999>"[..]),
+        (150_001, &b"/Length 150001>"[..], &b"/Length  99999>"[..]),
+        (131_067, &b"/Length 131067>"[..], &b"/Length  99999>"[..]),
+    ] {
+        let mut bytes = encrypted(document(content_len), "RC4");
+        let at = bytes.windows(found.len()).position(|window| window == found).unwrap();
+        bytes[at..at + wrong.len()].copy_from_slice(wrong);
+        assert_matches_whole(&bytes, USER);
+    }
+}
+
+#[test]
+fn an_endstream_without_endobj_after_it_does_not_end_the_stream() {
+    // The stored data holds `endstream` after an end of line, but no `endobj` follows it, so
+    // only the real end qualifies and the wrong /Length is recovered.
+    let mut doc = document(10);
+    let mut data = b"first part\nendstream but no end of object here".to_vec();
+    data.resize(64, b'.');
+    let id = doc.add_object(Stream::new(dictionary! {}, data));
+    doc.trailer.set("Extra", id);
+    let mut bytes = encrypted(doc, "Identity");
+    let at = bytes.windows(11).position(|window| window == b"/Length 64>").unwrap();
+    bytes[at..at + 11].copy_from_slice(b"/Length 63>");
+
+    assert_matches_whole(&bytes, USER);
+}
+
+#[test]
+fn an_ambiguous_end_of_stream_needs_the_whole_document_path() {
+    // Data stored as it is that holds what looks like the end of the stream, and a wrong /Length:
+    // two places could end it.
+    let mut doc = document(10);
+    let mut data = b"first part\nendstream\nendobj\nsecond part".to_vec();
+    data.resize(64, b'.');
+    let id = doc.add_object(Stream::new(dictionary! {}, data));
+    doc.trailer.set("Extra", id);
+    let mut bytes = encrypted(doc, "Identity");
+    let at = bytes.windows(11).position(|window| window == b"/Length 64>").unwrap();
+    bytes[at..at + 11].copy_from_slice(b"/Length 63>");
 
     assert!(matches!(
-        stripped(&damaged, USER),
+        stripped(&bytes, USER),
         Err(Error::NeedsWholeDocument(StripFallback::LengthMismatch))
     ));
 }
