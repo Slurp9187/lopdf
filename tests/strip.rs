@@ -305,7 +305,7 @@ fn a_streams_crypt_filter_is_taken_out_with_its_parameters() {
 }
 
 #[test]
-fn an_embedded_file_filter_other_than_the_stream_filter_is_refused() {
+fn an_embedded_file_filter_other_than_the_stream_filter_needs_the_whole_document_path() {
     let mut doc = encrypted_document(document(10), "AES-128");
     let encrypt = doc.trailer.get(b"Encrypt").unwrap().as_reference().unwrap();
     doc.get_dictionary_mut(encrypt)
@@ -315,9 +315,7 @@ fn an_embedded_file_filter_other_than_the_stream_filter_is_refused() {
 
     assert!(matches!(
         stripped(&bytes, USER),
-        Err(Error::Decryption(
-            lopdf::encryption::DecryptionError::UnsupportedEncryption
-        ))
+        Err(Error::NeedsWholeDocument(StripFallback::EmbeddedFileFilter))
     ));
 }
 

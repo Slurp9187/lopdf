@@ -56,6 +56,10 @@ pub struct Inspection {
     pub password: PasswordCheck,
     /// Whether the file holds a signature a Strip would invalidate.
     pub signed: Signed,
+    /// Whether the catalog's `/Perms` holds a usage-rights signature (`/UR3`, or the older `/UR`),
+    /// which a Strip invalidates too. It is not a form field, so it is not in [`Self::signed`]. False
+    /// also when the catalog cannot be read; `signed` is then [`Signed::Unknown`].
+    pub usage_rights: bool,
     /// Why the streaming Strip would need the whole-document path, when that is known up front. A
     /// [`strip`] can still find a reason later, in a stream it reads.
     pub needs_whole_document: Option<StripFallback>,
@@ -149,6 +153,9 @@ pub enum StripFallback {
     LengthMismatch,
     /// A stream uses a crypt filter that cannot decrypt in chunks.
     UnsupportedCryptFilter,
+    /// `/EFF` names a different crypt filter than `/StmF`. Embedded files are found through every
+    /// file specification, which takes the whole document.
+    EmbeddedFileFilter,
 }
 
 impl fmt::Display for StripFallback {
@@ -165,6 +172,7 @@ impl fmt::Display for StripFallback {
             StripFallback::LengthUnresolvable => "a stream's /Length cannot be resolved",
             StripFallback::LengthMismatch => "endstream does not follow a stream's data",
             StripFallback::UnsupportedCryptFilter => "a crypt filter cannot decrypt in chunks",
+            StripFallback::EmbeddedFileFilter => "embedded files use a crypt filter of their own",
         })
     }
 }
