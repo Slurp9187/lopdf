@@ -2,7 +2,7 @@
 //! the objects a password load gives, and a failure is the same error.
 
 use lopdf::encryption::crypt_filters::{Aes128CryptFilter, Aes256CryptFilter, CryptFilter};
-use lopdf::strip::{StripFallback, StripOptions, strip};
+use lopdf::strip::{StripFallback, StripObserver, StripOptions, strip, strip_observed, verify_stripped};
 use lopdf::{
     Document, EncryptionState, EncryptionVersion, Error, LoadOptions, Object, ObjectId, Permissions, Stream, dictionary,
 };
@@ -410,4 +410,128 @@ fn an_update_that_drops_encrypt_needs_the_whole_document_path() {
         stripped(&bytes, USER),
         Err(Error::NeedsWholeDocument(StripFallback::InconsistentEncrypt))
     ));
+}
+
+/// What an observer saw, with each stream's data joined: the two sides may cut it differently.
+#[derive(Debug, Default, PartialEq)]
+struct Recorder {
+    events: Vec<Event>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Event {
+    Object(ObjectId),
+    String(Vec<u8>),
+    Stream { length: u64, data: Vec<u8> },
+}
+
+impl StripObserver for Recorder {
+    fn object(&mut self, id: ObjectId) {
+        self.events.push(Event::Object(id));
+    }
+
+    fn string(&mut self, plaintext: &[u8]) {
+        self.events.push(Event::String(plaintext.to_vec()));
+    }
+
+    fn stream(&mut self, length: u64) {
+        self.events.push(Event::Stream {
+            length,
+            data: Vec::new(),
+        });
+    }
+
+    fn stream_data(&mut self, plaintext: &[u8]) {
+        match self.events.last_mut() {
+            Some(Event::Stream { data, .. }) => data.extend_from_slice(plaintext),
+            _ => panic!("stream data outside a stream"),
+        }
+    }
+}
+
+/// Strips `bytes`, recording what the Strip wrote, and returns that with the output.
+fn observed(bytes: &[u8], password: &str) -> (Recorder, Vec<u8>) {
+    let mut recorder = Recorder::default();
+    let mut output = Vec::new();
+    strip_observed(
+        Cursor::new(bytes),
+        &mut output,
+        &StripOptions::with_password(password),
+        &mut recorder,
+    )
+    .unwrap();
+    (recorder, output)
+}
+
+fn read_back(output: &[u8]) -> lopdf::Result<Recorder> {
+    let mut recorder = Recorder::default();
+    verify_stripped(Cursor::new(output), &mut recorder)?;
+    Ok(recorder)
+}
+
+#[test]
+fn reading_the_output_back_sees_what_the_strip_wrote() {
+    let mut files = vec![
+        (std::fs::read("assets/encrypted.pdf").unwrap(), ""),
+        (std::fs::read("tests/fixtures/crypt/identity-stmf.pdf").unwrap(), USER),
+        (
+            std::fs::read("tests/fixtures/crypt/stream-dict-string.pdf").unwrap(),
+            USER,
+        ),
+    ];
+    for version in ["RC4", "AES-128", "AES-256"] {
+        files.push((encrypted(document(150_001), version), USER));
+    }
+
+    let (mut strings, mut streams) = (0, 0);
+    for (bytes, password) in files {
+        let (written, output) = observed(&bytes, password);
+        assert!(!written.events.is_empty());
+        strings += written
+            .events
+            .iter()
+            .filter(|event| matches!(event, Event::String(_)))
+            .count();
+        streams += written
+            .events
+            .iter()
+            .filter(|event| matches!(event, Event::Stream { .. }))
+            .count();
+        assert_eq!(read_back(&output).unwrap(), written);
+    }
+    assert!(strings > 0 && streams > 0);
+}
+
+#[test]
+fn a_changed_byte_in_the_output_is_seen() {
+    let (written, output) = observed(&encrypted(document(1000), "AES-256"), USER);
+
+    for needle in [&b"BT (stream) Tj ET"[..], b"A title"] {
+        let at = output
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap();
+        let mut changed = output.clone();
+        changed[at] ^= 0x01;
+        assert_ne!(
+            read_back(&changed).unwrap(),
+            written,
+            "{}",
+            String::from_utf8_lossy(needle)
+        );
+    }
+}
+
+#[test]
+fn an_output_that_does_not_read_back_fails_the_check() {
+    let (_, output) = observed(&encrypted(document(1000), "AES-256"), USER);
+
+    // An object under another number than its cross-reference entry says.
+    let at = output.windows(8).position(|window| window == b"\n6 0 obj").unwrap();
+    let mut renumbered = output.clone();
+    renumbered[at + 1] = b'9';
+    assert!(read_back(&renumbered).is_err());
+
+    let truncated = &output[..output.len() / 2];
+    assert!(read_back(truncated).is_err());
 }
