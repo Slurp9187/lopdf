@@ -57,9 +57,27 @@ impl Xref {
 
     /// Combine Xref entries. Only add them if they do not exists already.
     /// Do not replace existing entries.
+    ///
+    /// `self` holds the newer section, so its entries win, free entries included: an object
+    /// freed by an incremental update stays freed rather than reviving an older revision's copy.
     pub fn merge(&mut self, xref: Xref) {
         for (id, entry) in xref.entries {
             self.entries.entry(id).or_insert(entry);
+        }
+    }
+
+    /// Merge the cross-reference stream that one section of a hybrid-reference file points to with
+    /// `/XRefStm` into that section's table. The table may list the objects held in object streams
+    /// as free so that older readers skip them, so within the section a stream entry replaces a free
+    /// table entry (ISO 32000-1, 7.5.8.4). Call it before merging the section with older ones.
+    pub fn merge_hybrid_stream(&mut self, stream: Xref) {
+        for (id, entry) in stream.entries {
+            match self.entries.get(&id) {
+                None | Some(XrefEntry::Free | XrefEntry::UnusableFree) => {
+                    self.entries.insert(id, entry);
+                }
+                Some(_) => {}
+            }
         }
     }
 
@@ -76,6 +94,16 @@ impl Xref {
 }
 
 impl XrefEntry {
+    /// A free entry with generation `generation`. Generation 65535 marks an entry that can never
+    /// be reused.
+    pub fn free(generation: u32) -> XrefEntry {
+        if generation == 65535 {
+            XrefEntry::UnusableFree
+        } else {
+            XrefEntry::Free
+        }
+    }
+
     pub fn is_normal(&self) -> bool {
         matches!(*self, XrefEntry::Normal { .. })
     }
