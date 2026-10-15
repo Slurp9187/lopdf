@@ -140,6 +140,61 @@ fn an_update_that_drops_encrypt_is_reported_up_front() {
     assert_eq!(found.needs_whole_document, Some(StripFallback::InconsistentEncrypt));
 }
 
+#[test]
+fn an_embedded_file_filter_of_its_own_is_reported_up_front() {
+    let mut doc = with_fields(vec![]);
+    let aes: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
+    let state = EncryptionState::try_from(EncryptionVersion::V5 {
+        encrypt_metadata: true,
+        crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes)]),
+        file_encryption_key: &[3; 32],
+        stream_filter: b"StdCF".to_vec(),
+        string_filter: b"StdCF".to_vec(),
+        owner_password: "owner",
+        user_password: "user",
+        permissions: Permissions::all(),
+    })
+    .unwrap();
+    doc.encrypt(&state).unwrap();
+    let encrypt = doc.trailer.get(b"Encrypt").unwrap().as_reference().unwrap();
+    doc.get_dictionary_mut(encrypt)
+        .unwrap()
+        .set("EFF", Object::Name(b"Identity".to_vec()));
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+
+    let found = inspect_bytes(&bytes, Some("user")).unwrap();
+    assert_eq!(found.needs_whole_document, Some(StripFallback::EmbeddedFileFilter));
+}
+
+#[test]
+fn a_usage_rights_signature_is_reported_apart_from_signed_fields() {
+    // The form's catalog holds /Perms /UR3, and no signed signature field.
+    let bytes = std::fs::read("assets/encrypted.pdf").unwrap();
+    let found = inspect_bytes(&bytes, None).unwrap();
+    assert!(found.usage_rights);
+    assert_eq!(found.signed, Signed::No);
+
+    for bytes in [
+        std::fs::read("tests/fixtures/crypt/identity-stmf.pdf").unwrap(),
+        std::fs::read("assets/example.pdf").unwrap(),
+    ] {
+        assert!(!inspect_bytes(&bytes, Some("user")).unwrap().usage_rights);
+    }
+}
+
+#[test]
+fn the_older_usage_rights_entry_counts_too() {
+    let mut doc = with_fields(vec![]);
+    let catalog = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+    doc.get_dictionary_mut(catalog)
+        .unwrap()
+        .set("Perms", dictionary! { "UR" => dictionary! { "Type" => "Sig" } });
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    assert!(inspect_bytes(&bytes, None).unwrap().usage_rights);
+}
+
 /// Appends an empty incremental update whose trailer leaves out `/Encrypt`.
 pub fn append_update_without_encrypt(bytes: &mut Vec<u8>) {
     let tail = &bytes[bytes.len().saturating_sub(64)..];
