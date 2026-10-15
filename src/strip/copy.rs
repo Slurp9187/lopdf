@@ -576,3 +576,224 @@ fn wipe_object(object: &mut Object) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::strip;
+    use crate::encryption::crypt_filters::{Aes256CryptFilter, CryptFilter};
+    use crate::strip::{Caps, StripFallback, StripOptions};
+    use crate::writer::{Writer, XRefStreamFilter};
+    use crate::xref::{Xref, XrefEntry, XrefType};
+    use crate::{
+        DecompressError, Document, EncryptionState, EncryptionVersion, Error, LoadOptions, Object, Permissions, Stream,
+        dictionary,
+    };
+    use std::collections::BTreeMap;
+    use std::io::{Cursor, Write as _};
+    use std::sync::Arc;
+
+    const CONTENT: &[u8] = b"BT /F1 12 Tf (Inside a content stream) Tj ET";
+
+    /// Writes object `id` at the end of `pdf` and records its offset in `xref`.
+    fn write_object(pdf: &mut Vec<u8>, xref: &mut Xref, id: u32, object: &Object) {
+        xref.insert(
+            id,
+            XrefEntry::Normal {
+                offset: pdf.len() as u32,
+                generation: 0,
+            },
+        );
+        writeln!(pdf, "{id} 0 obj").unwrap();
+        match object {
+            Object::Stream(stream) => {
+                Writer::write_object(pdf, &Object::Dictionary(stream.dict.clone())).unwrap();
+                pdf.extend_from_slice(b"\nstream\n");
+                pdf.extend_from_slice(&stream.content);
+                pdf.extend_from_slice(b"\nendstream");
+            }
+            other => Writer::write_object(pdf, other).unwrap(),
+        }
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    /// An AES-256 file whose catalog, page tree, `/Info` and the length of its content stream live
+    /// in an object stream, indexed by a cross-reference stream:
+    ///
+    /// - 1 catalog, 2 page tree, 3 `/Info`, 7 the content stream's length, all in object stream 4;
+    /// - 5 the encryption dictionary, 6 the content stream, whose `/Length` is `7 0 R`;
+    /// - 8 the cross-reference stream.
+    fn object_stream_file() -> Vec<u8> {
+        let aes: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
+        let state = EncryptionState::try_from(EncryptionVersion::V5 {
+            encrypt_metadata: true,
+            crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes)]),
+            file_encryption_key: &[9; 32],
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_password: "owner",
+            user_password: "user",
+            permissions: Permissions::all(),
+        })
+        .unwrap();
+
+        let mut content = Object::Stream(Stream::new(dictionary! {}, CONTENT.to_vec()));
+        crate::encryption::encrypt_object(&state, (6, 0), &mut content).unwrap();
+        let Object::Stream(mut content) = content else {
+            unreachable!("a stream stays a stream");
+        };
+        let ciphertext_len = content.content.len();
+        content.dict.set("Length", Object::Reference((7, 0)));
+
+        // Members are not encrypted one by one: the object stream is, as a whole.
+        let members = [
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Kids [] /Count 0 >>".to_string()),
+            (3, "<< /Title (In an object stream) >>".to_string()),
+            (7, ciphertext_len.to_string()),
+        ];
+        let mut header = String::new();
+        let mut bodies = String::new();
+        for (number, body) in &members {
+            header.push_str(&format!("{number} {} ", bodies.len()));
+            bodies.push_str(body);
+            bodies.push(' ');
+        }
+        let mut container = Stream::new(
+            dictionary! { "Type" => "ObjStm", "N" => members.len() as i64, "First" => header.len() as i64 },
+            format!("{header}{bodies}").into_bytes(),
+        );
+        container.compress().unwrap();
+        let mut container = Object::Stream(container);
+        crate::encryption::encrypt_object(&state, (4, 0), &mut container).unwrap();
+
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut xref = Xref::new(9, XrefType::CrossReferenceStream);
+        write_object(&mut pdf, &mut xref, 4, &container);
+        write_object(&mut pdf, &mut xref, 5, &Object::Dictionary(state.encode().unwrap()));
+        write_object(&mut pdf, &mut xref, 6, &Object::Stream(content));
+        for (index, (number, _)) in members.iter().enumerate() {
+            xref.insert(
+                *number,
+                XrefEntry::Compressed {
+                    container: 4,
+                    index: index as u16,
+                },
+            );
+        }
+        let xref_at = pdf.len();
+        xref.insert(
+            8,
+            XrefEntry::Normal {
+                offset: xref_at as u32,
+                generation: 0,
+            },
+        );
+        let (data, data_len, index) = Writer::create_xref_steam(&xref, XRefStreamFilter::None).unwrap();
+        let dict = dictionary! {
+            "Type" => "XRef",
+            "Size" => 9,
+            "W" => vec![1.into(), 4.into(), 2.into()],
+            "Index" => index,
+            "Length" => data_len as i64,
+            "Root" => Object::Reference((1, 0)),
+            "Info" => Object::Reference((3, 0)),
+            "Encrypt" => Object::Reference((5, 0)),
+        };
+        pdf.extend_from_slice(b"8 0 obj\n");
+        Writer::write_object(&mut pdf, &Object::Dictionary(dict)).unwrap();
+        pdf.extend_from_slice(b"\nstream\n");
+        pdf.extend_from_slice(&data);
+        pdf.extend_from_slice(b"\nendstream\nendobj\nstartxref\n");
+        pdf.extend_from_slice(format!("{xref_at}\n%%EOF\n").as_bytes());
+        pdf
+    }
+
+    fn stripped(bytes: &[u8], caps: &Caps) -> crate::Result<Vec<u8>> {
+        let mut output = Vec::new();
+        strip(
+            Cursor::new(bytes),
+            &mut output,
+            &StripOptions::with_password("user"),
+            caps,
+        )?;
+        Ok(output)
+    }
+
+    /// Each object but cross-reference streams, as text, stream content included.
+    fn objects(doc: &Document) -> BTreeMap<crate::ObjectId, String> {
+        doc.objects
+            .iter()
+            .filter(|(_, object)| object.type_name().ok() != Some(b"XRef"))
+            .map(|(id, object)| match object {
+                Object::Stream(stream) => (*id, format!("{:?} {:?}", stream.dict, stream.content)),
+                other => (*id, format!("{other:?}")),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn object_streams_are_copied_whole_and_an_indirect_length_is_read_from_one() {
+        let bytes = object_stream_file();
+        let expected = Document::load_mem_with_options(&bytes, LoadOptions::with_password("user")).unwrap();
+        assert_eq!(
+            expected.get_object((6, 0)).unwrap().as_stream().unwrap().content,
+            CONTENT,
+            "the oracle reads the file"
+        );
+
+        let output = stripped(&bytes, &Caps::default()).unwrap();
+        let strict = LoadOptions {
+            strict: true,
+            ..Default::default()
+        };
+        let actual = Document::load_mem_with_options(&output, strict).unwrap();
+
+        assert_eq!(objects(&actual), objects(&expected));
+        assert_eq!(actual.get_object((6, 0)).unwrap().as_stream().unwrap().content, CONTENT);
+        assert!(actual.reference_table.get(3).is_some_and(XrefEntry::is_compressed));
+        assert!(output.starts_with(b"%PDF-1.7\n"));
+        assert!(!actual.trailer.has(b"Encrypt"));
+        assert_eq!(actual.trailer.get(b"Info").unwrap().as_reference().unwrap(), (3, 0));
+    }
+
+    #[test]
+    fn an_object_stream_past_the_decompression_cap_is_refused() {
+        let caps = Caps {
+            max_decoded: 32,
+            ..Caps::default()
+        };
+        let result = stripped(&object_stream_file(), &caps);
+        assert!(
+            matches!(
+                result,
+                Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. }))
+            ),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn a_compressed_entry_whose_container_is_not_an_object_stream_needs_the_whole_document_path() {
+        // Point the members at object 6, the content stream, by rewriting the container number in
+        // the cross-reference stream's type 2 entries.
+        let mut bytes = object_stream_file();
+        let xref_at = bytes.windows(8).rposition(|window| window == b"8 0 obj\n").unwrap();
+        let data_at = xref_at
+            + bytes[xref_at..]
+                .windows(7)
+                .position(|window| window == b"stream\n")
+                .unwrap()
+            + 7;
+        for entry in bytes[data_at..data_at + 9 * 7].chunks_mut(7) {
+            if entry[0] == 2 {
+                entry[1..5].copy_from_slice(&6u32.to_be_bytes());
+            }
+        }
+
+        assert!(matches!(
+            stripped(&bytes, &Caps::default()),
+            Err(Error::NeedsWholeDocument(StripFallback::BadObjectStream))
+        ));
+    }
+}
