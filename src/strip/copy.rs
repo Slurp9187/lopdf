@@ -3,8 +3,8 @@
 
 use super::index::{Index, read_index};
 use super::source::Source;
-use super::{Caps, StripFallback, StripOptions, StripReport};
-use crate::encryption::stream::{ChunkDecipher, MAX_EXPANSION};
+use super::{Caps, Inspection, PasswordCheck, Signed, StripFallback, StripOptions, StripReport};
+use crate::encryption::stream::{ChunkDecipher, IdentityDecipher, MAX_EXPANSION};
 use crate::encryption::{self, PasswordAlgorithm};
 use crate::parser::{self, ObjectHead};
 use crate::writer::{Writer, XRefStreamFilter};
@@ -36,25 +36,112 @@ pub(crate) fn strip<R: Read + Seek, W: Write>(
     }
 
     let version = read_version(&mut source, index.base)?;
-    let (state, encrypt_id) = open_encryption(&mut source, &index, caps, options)?;
+    let (stand_in, encrypt_id) = stand_in(&mut source, &index, caps)?;
+    check_embedded_file_filter(&stand_in)?;
 
-    let mut stripper = Stripper {
-        source,
-        out: Output {
-            inner: output,
-            position: 0,
-        },
-        index,
-        state,
-        caps: *caps,
-        decoded: 0,
-        container: None,
-        input: Zeroizing::new(vec![0; CHUNK]),
-        output: Zeroizing::new(vec![0; CHUNK + MAX_EXPANSION]),
-        report: StripReport::default(),
+    let password: &str = if stand_in.authenticate_password("").is_ok() {
+        ""
+    } else if stand_in.authenticate_password(&options.password).is_ok() {
+        &options.password
+    } else {
+        return Err(Error::InvalidPassword);
     };
+    let state = decryption_state(&stand_in, password)?;
+
+    let mut stripper = Stripper::new(source, output, index, Some(state), caps);
     stripper.copy(&version, encrypt_id)?;
     Ok(stripper.report)
+}
+
+/// Reports what [`super::inspect`] reports. Writes nothing and decrypts no stream data but, where
+/// the signature fields live in an object stream, that one object stream.
+pub(crate) fn inspect<R: Read + Seek>(input: R, password: Option<&str>, caps: &Caps) -> Result<Inspection> {
+    let mut source = Source::new(input)?;
+    let index = read_index(&mut source, caps)?;
+    let encrypted = index.trailer.has(b"Encrypt");
+
+    let mut needs_whole_document = None;
+    if index.older_trailer_has_encrypt {
+        needs_whole_document = Some(StripFallback::InconsistentEncrypt);
+    }
+    if let Err(reason) = check_containers(&index) {
+        needs_whole_document.get_or_insert(reason);
+    }
+
+    let mut check = PasswordCheck::NotGiven;
+    let mut state = None;
+    if encrypted {
+        match stand_in(&mut source, &index, caps) {
+            Ok((stand_in, _)) => {
+                if let Some(password) = password {
+                    check = if stand_in.authenticate_user_password(password).is_ok() {
+                        PasswordCheck::User
+                    } else if stand_in.authenticate_owner_password(password).is_ok() {
+                        PasswordCheck::Owner
+                    } else {
+                        PasswordCheck::Wrong
+                    };
+                }
+                // The key, if one opens the file, to read signature fields in an object stream.
+                let opening = match check {
+                    PasswordCheck::User | PasswordCheck::Owner => password,
+                    _ => stand_in.authenticate_password("").is_ok().then_some(""),
+                };
+                if let Some(opening) = opening {
+                    state = Some(decryption_state(&stand_in, opening)?);
+                }
+            }
+            Err(Error::NeedsWholeDocument(reason)) => {
+                needs_whole_document.get_or_insert(reason);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let mut stripper = Stripper::new(source, io::sink(), index, state, caps);
+    stripper.encrypted = encrypted;
+    let signed = stripper.signed();
+
+    Ok(Inspection {
+        encrypted,
+        password: check,
+        signed,
+        needs_whole_document,
+    })
+}
+
+/// Every container a compressed entry names must be a generation-0 object.
+fn check_containers(index: &Index) -> std::result::Result<HashSet<u32>, StripFallback> {
+    let containers: HashSet<u32> = index
+        .entries
+        .iter()
+        .filter_map(|(_, entry)| match entry {
+            XrefEntry::Compressed { container, .. } => Some(*container),
+            _ => None,
+        })
+        .collect();
+    for &container in &containers {
+        if !matches!(index.get(container), Some(XrefEntry::Normal { generation: 0, .. })) {
+            return Err(StripFallback::BadObjectStream);
+        }
+    }
+    Ok(containers)
+}
+
+/// The Strip decrypts embedded files with `/StmF`, so a different `/EFF` is refused rather than
+/// decrypted with the wrong filter. An absent `/StmF` or `/EFF` means `/Identity`.
+fn check_embedded_file_filter(stand_in: &Document) -> Result<()> {
+    let encrypt = stand_in.get_encrypted()?;
+    let name = |key: &[u8]| {
+        encrypt
+            .get(key)
+            .and_then(Object::as_name)
+            .map_or(b"Identity".to_vec(), <[u8]>::to_vec)
+    };
+    if encrypt.has(b"EFF") && name(b"EFF") != name(b"StmF") {
+        return Err(encryption::DecryptionError::UnsupportedEncryption.into());
+    }
+    Ok(())
 }
 
 /// The version in the `%PDF-` header at `base`.
@@ -63,12 +150,12 @@ fn read_version<R: Read + Seek>(source: &mut Source<R>, base: u64) -> Result<Str
     parser::header(&head, false).ok_or(fallback(StripFallback::NoHeader))
 }
 
-/// Authenticates the password, as a whole-document load does, and builds the decryption state from
-/// a stand-in document that holds only the trailer and the encryption dictionary. Returns the id
-/// of the encryption dictionary, which is not copied.
-fn open_encryption<R: Read + Seek>(
-    source: &mut Source<R>, index: &Index, caps: &Caps, options: &StripOptions,
-) -> Result<(EncryptionState, Option<ObjectId>)> {
+/// A stand-in document that holds only the trailer and the encryption dictionary, enough to check a
+/// password and build the decryption state, and the id of the encryption dictionary, which is not
+/// copied.
+fn stand_in<R: Read + Seek>(
+    source: &mut Source<R>, index: &Index, caps: &Caps,
+) -> Result<(Document, Option<ObjectId>)> {
     let encrypt = index.trailer.get(b"Encrypt").map_err(|_| Error::NotEncrypted)?;
 
     let mut stand_in = Document::new();
@@ -100,19 +187,14 @@ fn open_encryption<R: Read + Seek>(
         }
         _ => return Err(fallback(StripFallback::EncryptUnreadable)),
     };
+    Ok((stand_in, encrypt_id))
+}
 
-    let password: &str = if stand_in.authenticate_password("").is_ok() {
-        ""
-    } else if stand_in.authenticate_password(&options.password).is_ok() {
-        &options.password
-    } else {
-        return Err(Error::InvalidPassword);
-    };
-
+/// The decryption state for `password`, which must authenticate.
+fn decryption_state(stand_in: &Document, password: &str) -> Result<EncryptionState> {
     // Derive the key from the same sanitized bytes `authenticate_password` checked.
-    let password = Zeroizing::new(PasswordAlgorithm::try_from(&stand_in)?.sanitize_password(password)?);
-    let state = EncryptionState::decode(&stand_in, &*password)?;
-    Ok((state, encrypt_id))
+    let password = Zeroizing::new(PasswordAlgorithm::try_from(stand_in)?.sanitize_password(password)?);
+    EncryptionState::decode(stand_in, &*password)
 }
 
 /// Reads the head of the object at `at` through a window that doubles until the head fits.
@@ -170,11 +252,16 @@ struct Stripper<R, W> {
     source: Source<R>,
     out: Output<W>,
     index: Index,
-    state: EncryptionState,
+    /// The decryption state; `inspect` may have none.
+    state: Option<EncryptionState>,
+    /// Whether the file is encrypted, so an object stream is never read as plaintext without the key.
+    encrypted: bool,
     caps: Caps,
     /// How much the object streams read so far decompressed to.
     decoded: usize,
     container: Option<Container>,
+    /// The offsets of the hint streams a linearization dictionary names, which are dropped with it.
+    hint_streams: HashSet<u64>,
     /// The chunk read from a stream, and the chunk decrypted from it. Both are wiped on drop.
     input: Zeroizing<Vec<u8>>,
     output: Zeroizing<Vec<u8>>,
@@ -182,22 +269,33 @@ struct Stripper<R, W> {
 }
 
 impl<R: Read + Seek, W: Write> Stripper<R, W> {
+    fn new(source: Source<R>, output: W, index: Index, state: Option<EncryptionState>, caps: &Caps) -> Self {
+        Self {
+            source,
+            out: Output {
+                inner: output,
+                position: 0,
+            },
+            index,
+            encrypted: state.is_some(),
+            state,
+            caps: *caps,
+            decoded: 0,
+            container: None,
+            hint_streams: HashSet::new(),
+            input: Zeroizing::new(vec![0; CHUNK]),
+            output: Zeroizing::new(vec![0; CHUNK + MAX_EXPANSION]),
+            report: StripReport::default(),
+        }
+    }
+
+    fn state(&self) -> Result<&EncryptionState> {
+        self.state.as_ref().ok_or(Error::InvalidPassword)
+    }
+
     fn copy(&mut self, version: &str, encrypt_id: Option<ObjectId>) -> Result<()> {
         // Object streams are copied whole, so their members keep their entries.
-        let containers: HashSet<u32> = self
-            .index
-            .entries
-            .iter()
-            .filter_map(|(_, entry)| match entry {
-                XrefEntry::Compressed { container, .. } => Some(*container),
-                _ => None,
-            })
-            .collect();
-        for &container in &containers {
-            if !matches!(self.index.get(container), Some(XrefEntry::Normal { generation: 0, .. })) {
-                return Err(fallback(StripFallback::BadObjectStream));
-            }
-        }
+        let containers = check_containers(&self.index).map_err(fallback)?;
 
         // Object streams need a cross-reference stream, which needs PDF 1.5.
         let compressed = !containers.is_empty();
@@ -249,8 +347,12 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
     }
 
     /// Copies the object `id` at `offset`, decrypted, and returns where it starts in the output, or
-    /// `None` for an object that is not copied: an old cross-reference stream.
+    /// `None` for an object that is not copied: an old cross-reference stream, or the linearization
+    /// dictionary and its hint streams, which describe a layout the output does not have.
     fn copy_object(&mut self, id: ObjectId, offset: u64, containers: &HashSet<u32>) -> Result<Option<u64>> {
+        if self.hint_streams.contains(&offset) {
+            return Ok(None);
+        }
         let at = self.index.base + offset;
         let (head_id, head, window) = read_head(&mut self.source, at, &self.caps)?;
         if head_id != id {
@@ -259,6 +361,18 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
         let start = self.out.position;
 
         match head {
+            ObjectHead::Direct {
+                object: Object::Dictionary(dict),
+                ..
+            } if dict.has(b"Linearized") => {
+                // /H holds the offset and length of one or two hint streams.
+                if let Ok(hints) = dict.get(b"H").and_then(Object::as_array) {
+                    let offsets = hints.iter().step_by(2).filter_map(|offset| offset.as_i64().ok());
+                    self.hint_streams
+                        .extend(offsets.filter_map(|offset| u64::try_from(offset).ok()));
+                }
+                return Ok(None);
+            }
             ObjectHead::Direct { object, end } if !has_strings(&object) => {
                 // Nothing to decrypt: copy the bytes as they are.
                 let from = window.iter().take_while(|byte| byte.is_ascii_whitespace()).count();
@@ -268,8 +382,9 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
                 }
             }
             ObjectHead::Direct { mut object, .. } => {
-                let result = encryption::decrypt_object(&self.state, id, &mut object)
-                    .map_err(Error::from)
+                let result = self
+                    .state()
+                    .and_then(|state| Ok(encryption::decrypt_object(state, id, &mut object)?))
                     .and_then(|()| self.write_direct(id, &object));
                 wipe_object(&mut object);
                 result?;
@@ -302,7 +417,7 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
         let length = self.resolve_length(dict.get(b"Length").ok())?;
         self.check_endstream(data_at, length)?;
 
-        let mut decipher = encryption::stream_decipher(&self.state, id, &dict)?
+        let mut decipher = encryption::stream_decipher(self.state()?, id, &dict)?
             .ok_or(fallback(StripFallback::UnsupportedCryptFilter))?;
         let plaintext_len = {
             let tail_len = (decipher.tail_len() as u64).min(length);
@@ -311,11 +426,13 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
         };
 
         let mut dict = Object::Dictionary(dict);
-        let result = encryption::decrypt_object(&self.state, id, &mut dict)
-            .map_err(Error::from)
+        let result = self
+            .state()
+            .and_then(|state| Ok(encryption::decrypt_object(state, id, &mut dict)?))
             .and_then(|()| {
                 if let Object::Dictionary(dict) = &mut dict {
                     dict.set("Length", plaintext_len as i64);
+                    remove_crypt_filter(dict);
                 }
                 writeln!(self.out, "{} {} obj", id.0, id.1)?;
                 Writer::write_object(&mut self.out, &dict)?;
@@ -370,7 +487,7 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
 
     fn resolve_length(&mut self, length: Option<&Object>) -> Result<u64> {
         let object = match length {
-            Some(Object::Reference(id)) => self.length_object(*id)?,
+            Some(Object::Reference(id)) => self.object(*id)?,
             Some(object) => object.clone(),
             None => return Err(fallback(StripFallback::LengthUnresolvable)),
         };
@@ -381,8 +498,9 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
             .ok_or(fallback(StripFallback::LengthUnresolvable))
     }
 
-    /// The object an indirect `/Length` names, from its own place or from an object stream.
-    fn length_object(&mut self, id: ObjectId) -> Result<Object> {
+    /// The direct object `id` names, from its own place or from an object stream: an indirect
+    /// `/Length`, or the catalog and form fields `inspect` walks. Its strings are not decrypted.
+    fn object(&mut self, id: ObjectId) -> Result<Object> {
         match self.index.get(id.0).cloned() {
             Some(XrefEntry::Normal { offset, generation }) if generation == id.1 => {
                 let at = self.index.base + u64::from(offset);
@@ -456,8 +574,13 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
         let data_at = at + data_start as u64;
         self.check_endstream(data_at, length as u64)?;
         let ciphertext = self.source.window(data_at, length)?;
-        let mut decipher = encryption::stream_decipher(&self.state, (container, 0), &dict)?
-            .ok_or(fallback(StripFallback::UnsupportedCryptFilter))?;
+        let mut decipher: Box<dyn ChunkDecipher> = match &self.state {
+            Some(state) => encryption::stream_decipher(state, (container, 0), &dict)?
+                .ok_or(fallback(StripFallback::UnsupportedCryptFilter))?,
+            // Never read an encrypted object stream as plaintext.
+            None if self.encrypted => return Err(Error::InvalidPassword),
+            None => Box::new(IdentityDecipher),
+        };
         let mut plaintext = Zeroizing::new(vec![0; length + MAX_EXPANSION]);
         let n = decipher.update(&ciphertext, &mut plaintext)?;
         let m = decipher.finish(&mut plaintext[n..])?;
@@ -549,6 +672,119 @@ impl<R: Read + Seek, W: Write> Stripper<R, W> {
         write!(self.out, "startxref\n{start}\n%%EOF\n")?;
         self.out.flush()?;
         Ok(())
+    }
+}
+
+/// The most form fields [`Stripper::signed`] looks at before answering [`Signed::Unknown`].
+const MAX_FIELDS: usize = 10_000;
+
+impl<R: Read + Seek, W: Write> Stripper<R, W> {
+    /// Whether the file holds a signature: a `/FT /Sig` field with a `/V` under the catalog's
+    /// `/AcroForm /Fields`, `/FT` inherited down `/Kids`. An unsigned signature field is not one.
+    /// Any object that cannot be read, or more than [`MAX_FIELDS`] fields, gives `Unknown`.
+    fn signed(&mut self) -> Signed {
+        self.find_signature().unwrap_or(Signed::Unknown)
+    }
+
+    fn find_signature(&mut self) -> Result<Signed> {
+        let root = self.index.trailer.get(b"Root")?.clone();
+        let root = self.resolve(&root)?;
+        let Ok(acro_form) = root.as_dict().and_then(|root| root.get(b"AcroForm")).cloned() else {
+            return Ok(Signed::No);
+        };
+        let acro_form = self.resolve(&acro_form)?;
+        let Ok(fields) = acro_form.as_dict().and_then(|form| form.get(b"Fields")).cloned() else {
+            return Ok(Signed::No);
+        };
+        let fields = self.resolve(&fields)?;
+
+        let mut pending: Vec<(Object, Option<Vec<u8>>)> =
+            fields.as_array()?.iter().map(|field| (field.clone(), None)).collect();
+        let mut seen = HashSet::new();
+        let mut looked_at = 0;
+        while let Some((field, inherited)) = pending.pop() {
+            if let Object::Reference(id) = field
+                && !seen.insert(id)
+            {
+                continue;
+            }
+            looked_at += 1;
+            if looked_at > MAX_FIELDS {
+                return Ok(Signed::Unknown);
+            }
+
+            let field = self.resolve(&field)?;
+            let Ok(field) = field.as_dict() else {
+                continue;
+            };
+            let field_type = field
+                .get(b"FT")
+                .and_then(Object::as_name)
+                .map(<[u8]>::to_vec)
+                .ok()
+                .or(inherited);
+            let has_value = field.get(b"V").is_ok_and(|value| !matches!(value, Object::Null));
+            if field_type.as_deref() == Some(b"Sig") && has_value {
+                return Ok(Signed::Yes);
+            }
+            if let Ok(kids) = field.get(b"Kids").and_then(Object::as_array) {
+                pending.extend(kids.iter().map(|kid| (kid.clone(), field_type.clone())));
+            }
+        }
+        Ok(Signed::No)
+    }
+
+    fn resolve(&mut self, object: &Object) -> Result<Object> {
+        match object {
+            Object::Reference(id) => self.object(*id),
+            other => Ok(other.clone()),
+        }
+    }
+}
+
+/// Takes the `/Crypt` filter out of a decrypted stream's `/Filter`, with its entry in `/DecodeParms`:
+/// the data is no longer encrypted, and the output has no crypt filters to name.
+fn remove_crypt_filter(dict: &mut Dictionary) {
+    let filters: Vec<Object> = match dict.get(b"Filter") {
+        Ok(Object::Name(name)) => vec![Object::Name(name.clone())],
+        Ok(Object::Array(names)) => names.clone(),
+        _ => return,
+    };
+    let Some(position) = filters
+        .iter()
+        .position(|filter| filter.as_name().ok() == Some(b"Crypt"))
+    else {
+        return;
+    };
+
+    let mut filters = filters;
+    filters.remove(position);
+    let parameters = match dict.get(b"DecodeParms") {
+        Ok(Object::Array(parameters)) => {
+            let mut parameters = parameters.clone();
+            if position < parameters.len() {
+                parameters.remove(position);
+            }
+            Some(parameters)
+        }
+        // A single dictionary goes with a single filter, the /Crypt one.
+        _ => None,
+    };
+
+    match filters.len() {
+        0 => {
+            dict.remove(b"Filter");
+            dict.remove(b"DecodeParms");
+        }
+        _ => {
+            dict.set("Filter", Object::Array(filters));
+            match parameters {
+                Some(parameters) => dict.set("DecodeParms", Object::Array(parameters)),
+                None => {
+                    dict.remove(b"DecodeParms");
+                }
+            }
+        }
     }
 }
 
