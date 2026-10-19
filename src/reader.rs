@@ -821,6 +821,7 @@ impl<'a> Reader<'a> {
                 .ok()
                 .and_then(|o| o.as_reference().ok());
 
+            let mut streams = Vec::new();
             for (obj_id, raw_bytes) in &self.raw_objects {
                 if let Some(enc_ref) = encrypt_ref
                     && *obj_id == enc_ref
@@ -829,6 +830,12 @@ impl<'a> Reader<'a> {
                 }
 
                 if let Ok((id, mut obj)) = self.parse_raw_object(raw_bytes) {
+                    // Whether a stream is an embedded file, which /EFF decrypts, is known only once
+                    // every file specification is, object streams included; streams wait for that.
+                    if obj.as_stream().is_ok_and(|stream| !stream.dict.has_type(b"ObjStm")) {
+                        streams.push((*obj_id, id, obj));
+                        continue;
+                    }
                     // An object that fails to decrypt fails the load: keeping it would leave
                     // ciphertext in a document that no longer says it is encrypted.
                     encryption::decrypt_object(state, *obj_id, &mut obj)?;
@@ -865,6 +872,16 @@ impl<'a> Reader<'a> {
                         Err(_e) => {}
                     }
                 }
+            }
+
+            let embedded_files = encryption::embedded_file_ids(self.document.objects.values());
+            for (obj_id, id, mut obj) in streams {
+                if embedded_files.contains(&obj_id) {
+                    encryption::decrypt_embedded_file(state, obj_id, &mut obj)?;
+                } else {
+                    encryption::decrypt_object(state, obj_id, &mut obj)?;
+                }
+                self.document.objects.insert(id, obj);
             }
 
             let mut stored_state = state.clone();
