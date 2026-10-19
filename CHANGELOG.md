@@ -1,4 +1,8 @@
 
+<a name="unreleased"></a>
+## [Unreleased](https://github.com/J-F-Liu/lopdf/compare/v0.45.0...HEAD)
+* Write `/Length 256` in a V5 `/Encrypt` dictionary and `/Length 32` in an AESV3 crypt filter, which LibreOffice needs to show an AES-256 document's pages
+
 <a name="v0.45.0"></a>
 ## [v0.45.0](https://github.com/J-F-Liu/lopdf/compare/v0.44.0...v0.45.0) (2026-09-08)
 * Accept 19-byte cross-reference entries when parsing leniently ([#564](https://github.com/J-F-Liu/lopdf/issues/564))
