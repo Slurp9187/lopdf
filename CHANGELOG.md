@@ -10,6 +10,7 @@
 * Keep free cross-reference entries, so an object freed by an incremental update stays freed instead of reviving an older revision's copy or an object-stream copy; within a hybrid-reference section, the `/XRefStm` entry replaces a free table entry. The parsed `Xref` now holds `Free` and `UnusableFree` entries
 * Fail loading an encrypted document when an object fails to decrypt, such as an AES string whose length is not a multiple of 16, instead of keeping its ciphertext; leave a signature dictionary's `/Contents` unencrypted and undecrypted, as the spec requires
 * Decrypt embedded file streams with the `/EFF` crypt filter, which was ignored: an embedded file is a stream a file specification's `/EF` names, or one with `/Type /EmbeddedFile`, and a stream's own `/Crypt` filter still wins
+* Write `/Length 256` in a V5 `/Encrypt` dictionary and `/Length 32` in an AESV3 crypt filter, which LibreOffice needs to show an AES-256 document's pages
 
 <a name="v0.45.0"></a>
 ## [v0.45.0](https://github.com/J-F-Liu/lopdf/compare/v0.44.0...v0.45.0) (2026-09-08)
