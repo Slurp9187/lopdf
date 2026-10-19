@@ -1,7 +1,16 @@
+use zeroize::Zeroize as _;
+
 // This module exists because the rust-crypto module is really old and not maintained.
 // Fortunately the RC4 algorithm is very simple to implement.
 pub struct Rc4 {
     initial_state: [u8; 256],
+}
+
+/// The key-scheduled state is as good as the key, so it is wiped on drop.
+impl Drop for Rc4 {
+    fn drop(&mut self) {
+        self.initial_state.zeroize();
+    }
 }
 
 impl Rc4 {
@@ -40,6 +49,7 @@ impl Rc4 {
             let key_byte = state[(state[i as usize].wrapping_add(state[j as usize])) as usize];
             *o_byte = i_byte ^ key_byte;
         }
+        state.zeroize();
     }
 
     /// Allocates a new Vec<u8> of the same length as `input` and decrypts
