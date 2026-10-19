@@ -1,4 +1,8 @@
 
+<a name="unreleased"></a>
+## [Unreleased](https://github.com/J-F-Liu/lopdf/compare/v0.45.0...HEAD)
+* Hold a real as an `f64`, so a value such as `595.303937007874` is saved as it was read instead of rounded to `595.30396`. `Object::Real` now holds an `f64`; `as_f64` is new, and `as_f32` and `as_float` still return an `f32`
+
 <a name="v0.45.0"></a>
 ## [v0.45.0](https://github.com/J-F-Liu/lopdf/compare/v0.44.0...v0.45.0) (2026-09-08)
 * Accept 19-byte cross-reference entries when parsing leniently ([#564](https://github.com/J-F-Liu/lopdf/issues/564))
