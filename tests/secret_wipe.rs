@@ -62,6 +62,10 @@ unsafe impl GlobalAlloc for WatchingAllocator {
                 MARKER_FREED.store(true, Ordering::SeqCst);
             }
         }
+        // Wipe every block once it has been inspected. Otherwise plaintext a test's own setup
+        // freed outlives it in free memory, and a block reused from there (a B-tree node, say,
+        // whose spare slots nothing writes) carries it into the scan from any thread.
+        unsafe { ptr.write_bytes(0, layout.size()) };
         unsafe { System.dealloc(ptr, layout) }
     }
 }
