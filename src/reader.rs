@@ -791,18 +791,27 @@ impl<'a> Reader<'a> {
             && self.should_rebuild(self.document.xref_recovery)
             && !Self::page_tree_loaded(&self.document)
         {
+            // The rebuilt load decodes streams again, so it gets what is left of the total.
             let options = LoadOptions {
                 password: self.password.clone(),
                 max_decompressed_size: self.max_decompressed_size,
+                max_total_decompressed_size: self
+                    .max_total_decompressed_size
+                    .map(|total| total.saturating_sub(self.decompressed_total.load(Ordering::SeqCst))),
                 force_reconstruct: true,
                 ..LoadOptions::default()
             };
-            if let Ok(rebuilt) = Reader::with_options(self.buffer, options).read(None)
-                && rebuilt.xref_recovery == Some(XrefRecovery::Reconstructed)
-                && Self::page_tree_loaded(&rebuilt)
-            {
-                warn!("{UNREADABLE_PAGE_TREE}");
-                return Ok(rebuilt);
+            match Reader::with_options(self.buffer, options).read(None) {
+                Ok(rebuilt)
+                    if rebuilt.xref_recovery == Some(XrefRecovery::Reconstructed)
+                        && Self::page_tree_loaded(&rebuilt) =>
+                {
+                    warn!("{UNREADABLE_PAGE_TREE}");
+                    return Ok(rebuilt);
+                }
+                // A decompression limit is never skipped, here either.
+                Err(e) if is_decompression_limit(&e) => return Err(e),
+                _ => {}
             }
         }
 
