@@ -157,3 +157,23 @@ fn an_already_encrypted_document_is_refused() {
     ));
     assert!(pdf.is_empty());
 }
+
+/// An encrypted save leaves the document as it was, as a plain save does since upstream #633:
+/// the `/Encrypt` dictionary is numbered after `max_id` for the save only, and the object
+/// streams after it, so none of them shares a number.
+#[test]
+fn an_encrypted_save_leaves_max_id_and_the_trailer_as_they_were() {
+    for options in [SaveOptions::default(), object_streams()] {
+        let mut doc = sample_document();
+        let max_id = doc.max_id;
+        let trailer = doc.trailer.clone();
+
+        let mut pdf = Vec::new();
+        doc.save_encrypted(&mut pdf, &aes256_state(), options.clone()).unwrap();
+
+        assert_eq!(doc.max_id, max_id, "{options:?}");
+        assert_eq!(doc.trailer, trailer, "{options:?}");
+        let loaded = strict_load(&pdf);
+        assert!(loaded.trailer.get(b"Info").is_ok(), "{options:?}");
+    }
+}

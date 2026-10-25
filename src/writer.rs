@@ -50,6 +50,9 @@ impl Document {
         if self.is_encrypted() {
             return Err(crate::Error::AlreadyEncrypted);
         }
+        // `/Encrypt` takes the number after `max_id` for this save only, so the streams the
+        // writer generates are numbered after it, and the document keeps its `max_id` (#633).
+        let max_id = self.max_id;
         let encrypt = Encrypt {
             state,
             dictionary: state.encode()?,
@@ -64,6 +67,7 @@ impl Document {
             self.save_internal_encrypted(target, Some(&encrypt))
         };
         self.trailer.remove(b"Encrypt");
+        self.max_id = max_id;
         Ok(saved?)
     }
 
