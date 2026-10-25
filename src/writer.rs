@@ -5,7 +5,7 @@ use std::vec;
 
 use super::Object::*;
 use super::{Dictionary, Document, Object, Stream, StringFormat};
-use crate::encryption;
+use crate::encryption::{self, EncryptionState};
 use crate::{IncrementalDocument, xref::*};
 
 impl Document {
@@ -28,20 +28,58 @@ impl Document {
     /// Object streams are skipped for an encrypted document, which is written with every
     /// object serialized individually instead. See [`Document::save_modern`].
     pub fn save_with_options<W: Write>(&mut self, target: &mut W, options: crate::SaveOptions) -> Result<()> {
-        // Xref streams and object streams are independent; select the requested type here so it
-        // applies to whichever path writes the body. Both arrived in PDF 1.5, so bump the version.
+        self.select_xref_type(&options);
+        if options.use_object_streams {
+            self.save_with_object_streams(target, options, None)
+        } else {
+            self.save_internal(target)
+        }
+    }
+
+    /// Encrypt the document as it is written, with the object streams `options` asks for.
+    ///
+    /// [`Document::encrypt`] encrypts every object in place and drops the key, so a later save
+    /// can only write the objects one by one: an object stream built then would go out in the
+    /// clear. Here each object is encrypted as it is written, and an object stream is packed
+    /// from plaintext and then encrypted as a whole, as a reader expects (the objects inside it
+    /// are not encrypted on their own). The document itself is left unencrypted; the `/Encrypt`
+    /// dictionary and a cross-reference stream are written unencrypted, as they must be.
+    pub fn save_encrypted<W: Write>(
+        &mut self, target: &mut W, state: &EncryptionState, options: crate::SaveOptions,
+    ) -> crate::Result<()> {
+        if self.is_encrypted() {
+            return Err(crate::Error::AlreadyEncrypted);
+        }
+        // `/Encrypt` takes the number after `max_id` for this save only, so the streams the
+        // writer generates are numbered after it, and the document keeps its `max_id` (#633).
+        let max_id = self.max_id;
+        let encrypt = Encrypt {
+            state,
+            dictionary: state.encode()?,
+            id: self.try_new_object_id()?,
+        };
+        self.select_xref_type(&options);
+        // The trailer names `/Encrypt` only while writing, so the document stays unencrypted.
+        self.trailer.set(b"Encrypt", Reference(encrypt.id));
+        let saved = if options.use_object_streams {
+            self.save_with_object_streams(target, options, Some(&encrypt))
+        } else {
+            self.save_internal_encrypted(target, Some(&encrypt))
+        };
+        self.trailer.remove(b"Encrypt");
+        self.max_id = max_id;
+        Ok(saved?)
+    }
+
+    /// Xref streams and object streams are independent; select the requested type here so it
+    /// applies to whichever path writes the body. Both arrived in PDF 1.5, so bump the version.
+    fn select_xref_type(&mut self, options: &crate::SaveOptions) {
         if options.use_xref_streams {
             self.reference_table.cross_reference_type = XrefType::CrossReferenceStream;
 
             if self.version.as_str() < "1.5" {
                 self.version = "1.5".to_string();
             }
-        }
-
-        if options.use_object_streams {
-            self.save_with_object_streams(target, options)
-        } else {
-            self.save_internal(target)
         }
     }
 
@@ -51,7 +89,8 @@ impl Document {
     /// encrypted by the time they reach the writer and the file encryption key is gone,
     /// so an object stream built here could only be written in the clear, contradicting
     /// the document's `/Encrypt` dictionary. The requested cross-reference type is still
-    /// used; cross-reference streams are never encrypted.
+    /// used; cross-reference streams are never encrypted. To encrypt with object streams, see
+    /// [`Document::save_encrypted`].
     pub fn save_modern<W: Write>(&mut self, target: &mut W) -> Result<()> {
         let options = crate::SaveOptions {
             use_object_streams: true,
@@ -70,6 +109,19 @@ impl Document {
     }
 
     fn save_internal<W: Write>(&mut self, target: &mut W) -> Result<()> {
+        self.save_internal_encrypted(target, None)
+    }
+
+    /// The plain save, with every object encrypted as it is written when `encrypt` is given.
+    fn save_internal_encrypted<W: Write>(&mut self, target: &mut W, encrypt: Option<&Encrypt>) -> Result<()> {
+        // A plain save uses the document's existing xref format, including the default stream.
+        if matches!(
+            self.reference_table.cross_reference_type,
+            XrefType::CrossReferenceStream
+        ) && self.version.as_str() < "1.5"
+        {
+            self.version = "1.5".to_string();
+        }
         let mut target = CountingWrite {
             inner: target,
             bytes_written: 0,
@@ -80,30 +132,47 @@ impl Document {
 
         Writer::write_binary_mark(&mut target, &self.binary_mark)?;
 
-        for (&(id, generation), object) in &self.objects {
+        for (&id, object) in &self.objects {
             if !Self::is_regenerated_on_save(object) {
-                Writer::write_indirect_object(&mut target, id, generation, object, &mut xref)?;
+                write_maybe_encrypted(&mut target, id, object, &mut xref, encrypt)?;
             }
+        }
+        if let Some(encrypt) = encrypt {
+            encrypt.write_dictionary(&mut target, &mut xref)?;
         }
 
         let xref_start = target.bytes_written;
-        self.write_xref_and_trailer(&mut target, &mut xref, xref_start)
+        Self::write_xref_and_trailer(&mut target, &mut xref, xref_start, self.trailer.clone(), self.max_id)
+    }
+
+    /// The number after `last_id`, for an object the writer generates: an object stream or the
+    /// cross-reference stream. These are numbered after [`Document::max_id`] without raising it,
+    /// so saving a document does not change it and saving it again writes the same file.
+    fn next_generated_id(last_id: &mut u32) -> Result<u32> {
+        *last_id = last_id
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other(crate::Error::ObjectIdOverflow))?;
+        Ok(*last_id)
     }
 
     /// Write the cross-reference data in the requested form, then the
     /// `startxref` pointer that closes the file.
+    ///
+    /// `trailer` is a copy of the document's trailer that the writer completes with `/Size` and,
+    /// for a cross-reference stream, the stream's own entries, so the document's trailer stays as
+    /// it was. `last_id` is the highest object number written so far.
     fn write_xref_and_trailer<W: Write>(
-        &mut self, target: &mut CountingWrite<&mut W>, xref: &mut Xref, xref_start: usize,
+        target: &mut CountingWrite<&mut W>, xref: &mut Xref, xref_start: usize, trailer: Dictionary, last_id: u32,
     ) -> Result<()> {
         // Pick right cross reference stream.
         match xref.cross_reference_type {
             XrefType::CrossReferenceTable => {
                 Writer::write_xref(target, xref)?;
-                self.write_trailer(target)?;
+                Self::write_trailer(target, trailer, last_id)?;
             }
             XrefType::CrossReferenceStream => {
                 // Cross Reference Stream instead of XRef and Trailer
-                self.write_cross_reference_stream(target, xref, xref_start as u32)?;
+                Self::write_cross_reference_stream(target, xref, xref_start as u32, trailer, last_id)?;
             }
         }
         // Write `startxref` part of trailer
@@ -111,7 +180,9 @@ impl Document {
     }
 
     /// Save PDF with object streams enabled
-    fn save_with_object_streams<W: Write>(&mut self, target: &mut W, options: crate::SaveOptions) -> Result<()> {
+    fn save_with_object_streams<W: Write>(
+        &mut self, target: &mut W, options: crate::SaveOptions, encrypt: Option<&Encrypt>,
+    ) -> Result<()> {
         use crate::ObjectStream;
         use std::collections::HashMap;
 
@@ -123,7 +194,8 @@ impl Document {
         // An object stream would go out unencrypted: `Document::encrypt` already dropped the key,
         // and the strings packed inside are themselves already encrypted (an object stream is the
         // unit of encryption). Write the objects out individually instead, as `save` does.
-        if self.is_encrypted() {
+        // `save_encrypted` packs the objects before it encrypts them, so it keeps object streams.
+        if encrypt.is_none() && self.is_encrypted() {
             return self.save_internal(target);
         }
 
@@ -152,7 +224,10 @@ impl Document {
                 continue; // Skip existing object streams
             }
 
-            if generation == 0 && ObjectStream::can_be_compressed((id, generation), object, self) {
+            // A signature's /Contents must stay unencrypted, which it cannot inside an encrypted
+            // object stream: write a signature dictionary on its own.
+            let keep_out = encrypt.is_some() && is_signature(object);
+            if generation == 0 && !keep_out && ObjectStream::can_be_compressed((id, generation), object, self) {
                 // Object can be compressed
                 // Find or create an object stream for it
                 let stream_index = object_streams.len().saturating_sub(1);
@@ -181,13 +256,17 @@ impl Document {
         }
 
         // Write direct objects first
-        for ((id, generation), object) in objects_to_write_directly {
-            Writer::write_indirect_object(&mut target, id, generation, object, &mut xref)?;
+        for (id, object) in objects_to_write_directly {
+            write_maybe_encrypted(&mut target, id, object, &mut xref, encrypt)?;
+        }
+        if let Some(encrypt) = encrypt {
+            encrypt.write_dictionary(&mut target, &mut xref)?;
         }
 
         // Write object streams
+        let mut last_id = self.max_id;
         for obj_stream in object_streams.into_iter() {
-            let (stream_id, _) = self.try_new_object_id().map_err(std::io::Error::other)?;
+            let stream_id = Self::next_generated_id(&mut last_id)?;
             let stream_obj = obj_stream.to_stream_object().map_err(std::io::Error::other)?;
 
             // Record compressed objects in xref. The index must match the order
@@ -202,12 +281,18 @@ impl Document {
                 );
             }
 
-            // Write the object stream
-            Writer::write_indirect_object(&mut target, stream_id, 0, &Object::Stream(stream_obj), &mut xref)?;
+            // Write the object stream, encrypted as a whole when the document is.
+            write_maybe_encrypted(
+                &mut target,
+                (stream_id, 0),
+                &Object::Stream(stream_obj),
+                &mut xref,
+                encrypt,
+            )?;
         }
 
         let xref_start = target.bytes_written;
-        self.write_xref_and_trailer(&mut target, &mut xref, xref_start)
+        Self::write_xref_and_trailer(&mut target, &mut xref, xref_start, self.trailer.clone(), last_id)
     }
 
     /// Write the Cross Reference Stream.
@@ -215,9 +300,9 @@ impl Document {
     /// Insert an `Object` to the end of the PDF (not visible when inspecting `Document`).
     /// Note: This is different from the "Cross Reference Table".
     fn write_cross_reference_stream<W: Write>(
-        &mut self, file: &mut CountingWrite<&mut W>, xref: &mut Xref, xref_start: u32,
+        file: &mut CountingWrite<&mut W>, xref: &mut Xref, xref_start: u32, mut trailer: Dictionary, mut last_id: u32,
     ) -> Result<()> {
-        let (new_obj_id_for_crs, _) = self.try_new_object_id().map_err(std::io::Error::other)?;
+        let new_obj_id_for_crs = Self::next_generated_id(&mut last_id)?;
         xref.insert(
             new_obj_id_for_crs,
             XrefEntry::Normal {
@@ -225,28 +310,27 @@ impl Document {
                 generation: 0,
             },
         );
-        self.trailer.set("Type", Name(b"XRef".to_vec()));
-        // Update `max_id` in trailer
-        self.trailer.set("Size", i64::from(self.max_id) + 1);
+        trailer.set("Type", Name(b"XRef".to_vec()));
+        // The cross-reference stream is the highest object number.
+        trailer.set("Size", i64::from(last_id) + 1);
         // `[u8, u32, u16]` per entry (the PDF default is `[1 2 1]`).
-        self.trailer.set("W", Array(vec![Integer(1), Integer(4), Integer(2)]));
+        trailer.set("W", Array(vec![Integer(1), Integer(4), Integer(2)]));
         // Note that `ASCIIHexDecode` does not work correctly,
         // but is still useful for debugging sometimes.
         let filter = XRefStreamFilter::None;
         let (stream, stream_length, indexes) = Writer::create_xref_steam(xref, filter)?;
-        self.trailer.set("Index", indexes);
+        trailer.set("Index", indexes);
 
         if filter == XRefStreamFilter::ASCIIHexDecode {
-            self.trailer.set("Filter", Name(b"ASCIIHexDecode".to_vec()));
+            trailer.set("Filter", Name(b"ASCIIHexDecode".to_vec()));
         } else {
-            self.trailer.remove(b"Filter");
+            trailer.remove(b"Filter");
         }
 
-        self.trailer.set("Length", stream_length as i64);
+        trailer.set("Length", stream_length as i64);
 
-        let trailer = &self.trailer;
         let cross_reference_stream = Stream(Stream {
-            dict: trailer.clone(),
+            dict: trailer,
             allows_compression: true,
             content: stream,
             start_position: None,
@@ -258,11 +342,48 @@ impl Document {
         Ok(())
     }
 
-    fn write_trailer(&mut self, file: &mut dyn Write) -> Result<()> {
-        self.trailer.set("Size", i64::from(self.max_id) + 1);
+    fn write_trailer(file: &mut dyn Write, mut trailer: Dictionary, last_id: u32) -> Result<()> {
+        trailer.set("Size", i64::from(last_id) + 1);
         file.write_all(b"trailer\n")?;
-        Writer::write_dictionary(file, &self.trailer)?;
+        Writer::write_dictionary(file, &trailer)?;
         Ok(())
+    }
+}
+
+/// What [`Document::save_encrypted`] encrypts with, and the `/Encrypt` dictionary it writes.
+struct Encrypt<'a> {
+    state: &'a EncryptionState,
+    dictionary: Dictionary,
+    id: crate::ObjectId,
+}
+
+impl Encrypt<'_> {
+    fn write_dictionary<W: Write>(&self, target: &mut CountingWrite<&mut W>, xref: &mut Xref) -> Result<()> {
+        let dictionary = Object::Dictionary(self.dictionary.clone());
+        Writer::write_indirect_object(target, self.id.0, self.id.1, &dictionary, xref)
+    }
+}
+
+/// A signature dictionary: `/Type /Sig` or `/DocTimeStamp`, or a `/ByteRange` beside `/Contents`.
+fn is_signature(object: &Object) -> bool {
+    let Object::Dictionary(dict) = object else {
+        return false;
+    };
+    dict.has_type(b"Sig") || dict.has_type(b"DocTimeStamp") || (dict.has(b"ByteRange") && dict.has(b"Contents"))
+}
+
+/// Write `object`, first encrypted under its own id when `encrypt` is given.
+fn write_maybe_encrypted<W: Write>(
+    target: &mut CountingWrite<&mut W>, id: crate::ObjectId, object: &Object, xref: &mut Xref,
+    encrypt: Option<&Encrypt>,
+) -> Result<()> {
+    match encrypt {
+        Some(encrypt) => {
+            let mut object = object.clone();
+            encryption::encrypt_object(encrypt.state, id, &mut object).map_err(std::io::Error::other)?;
+            Writer::write_indirect_object(target, id.0, id.1, &object, xref)
+        }
+        None => Writer::write_indirect_object(target, id.0, id.1, object, xref),
     }
 }
 
@@ -363,35 +484,29 @@ impl IncrementalDocument {
             }
         }
 
-        // Swap in a trailer copy carrying the /Encrypt reference, so the writers that mutate
-        // Size/W/Length see it; swap back so `new_document.trailer` stays clean for later saves.
-        let saved_trailer = if let Some(state) = encryption_state.as_ref() {
+        // Write a trailer copy carrying the /Encrypt reference, so `new_document.trailer` stays
+        // clean for later saves.
+        let mut trailer = self.new_document.trailer.clone();
+        if let Some(state) = encryption_state.as_ref() {
             let encrypt_id = state
                 .encrypt_object_id()
                 .expect("encrypt_object_id presence checked by check_incremental_save_supported");
-            let mut modified = self.new_document.trailer.clone();
-            modified.set(b"Encrypt", Object::Reference(encrypt_id));
-            Some(std::mem::replace(&mut self.new_document.trailer, modified))
-        } else {
-            None
-        };
+            trailer.set(b"Encrypt", Object::Reference(encrypt_id));
+        }
 
         let xref_start = target.bytes_written;
 
         // Pick right cross reference stream.
-        let write_result = self
-            .new_document
-            .write_xref_and_trailer(&mut target, &mut xref, xref_start);
-
-        // Restore the original in-memory trailer even if writing failed.
-        if let Some(saved) = saved_trailer {
-            self.new_document.trailer = saved;
-        }
-
-        write_result
+        Document::write_xref_and_trailer(&mut target, &mut xref, xref_start, trailer, self.new_document.max_id)
     }
 }
 
+/// Low-level PDF object serializer.
+///
+/// Exposed so that callers which write a document incrementally (reserving
+/// object ids up front and emitting the body as it is produced) can serialize
+/// individual objects with exactly the same bytes `Document::save` would
+/// produce, instead of reimplementing the format.
 pub struct Writer;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -547,6 +662,15 @@ impl Writer {
         Ok(())
     }
 
+    /// Serialize one object body (no `N G obj` / `endobj` wrapper).
+    ///
+    /// The bytes are identical to what [`Document::save`] writes for the same
+    /// object, so a caller assembling a file by hand can mix this with its own
+    /// framing and still produce a byte-compatible document.
+    ///
+    /// # Errors
+    ///
+    /// Propagates I/O errors from `file`.
     pub fn write_object(file: &mut dyn Write, object: &Object) -> Result<()> {
         match object {
             Null => file.write_all(b"null"),
@@ -561,7 +685,17 @@ impl Writer {
                 let mut buf = itoa::Buffer::new();
                 file.write_all(buf.format(*value).as_bytes())
             }
-            Real(value) => write!(file, "{value}"),
+            // `Display` writes every digit and never an exponent, which PDF syntax does not have,
+            // but it drops the point of a whole number (`0` for `0.0`), which would read back as
+            // an integer. NaN and the infinities have no PDF spelling and are left as they print.
+            Real(value) => {
+                let text = value.to_string();
+                file.write_all(text.as_bytes())?;
+                if value.is_finite() && !text.contains('.') {
+                    file.write_all(b".0")?;
+                }
+                Ok(())
+            }
             Name(name) => Writer::write_name(file, name),
             String(text, format) => Writer::write_string(file, text, format),
             Array(array) => Writer::write_array(file, array),
