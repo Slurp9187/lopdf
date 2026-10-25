@@ -1,4 +1,8 @@
 
+<a name="unreleased"></a>
+## [Unreleased](https://github.com/J-F-Liu/lopdf/compare/v0.45.0...HEAD)
+* Write a whole-number real with its point (`0.0`, `5.0`), so it reads back as a real instead of an integer. Every writer path goes through `Writer::write_object`: a save, an incremental update, an object stream and a content stream's operands. NaN and the infinities are written as before
+
 <a name="v0.45.0"></a>
 ## [v0.45.0](https://github.com/J-F-Liu/lopdf/compare/v0.44.0...v0.45.0) (2026-09-08)
 * Accept 19-byte cross-reference entries when parsing leniently ([#564](https://github.com/J-F-Liu/lopdf/issues/564))
