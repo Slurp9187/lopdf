@@ -908,20 +908,26 @@ impl<'a> Reader<'a> {
         let object_streams = Mutex::new(vec![]);
 
         // Map each compressed object to its xref container, so stale ObjStm copies (e.g. from
-        // linearization first-page sections) cannot override the correct version.
-        let compressed_obj_containers: BTreeMap<u32, u32> = self
+        // linearization first-page sections) cannot override the correct version. A freed object
+        // maps to no container, so no ObjStm copy of it is kept either.
+        let compressed_obj_containers: BTreeMap<u32, Option<u32>> = self
             .document
             .reference_table
             .entries
             .iter()
-            .filter_map(|(&id, entry)| {
-                if let XrefEntry::Compressed { container, .. } = entry {
-                    Some((id, *container))
-                } else {
-                    None
-                }
+            .filter_map(|(&id, entry)| match entry {
+                XrefEntry::Compressed { container, .. } => Some((id, Some(*container))),
+                XrefEntry::Free | XrefEntry::UnusableFree => Some((id, None)),
+                XrefEntry::Normal { .. } => None,
             })
             .collect();
+        // Whether a member of object stream `container_id` belongs in the document: an object the
+        // cross-reference data doesn't list is still recovered from the stream.
+        let keeps_member = |obj_num: &u32, container_id: u32| {
+            compressed_obj_containers
+                .get(obj_num)
+                .is_none_or(|&container| container == Some(container_id))
+        };
         let normal_offsets = &self.normal_offsets;
 
         let entries_filter_map = |(_, entry): (&_, &_)| -> Result<Option<(ObjectId, Object)>> {
@@ -980,20 +986,17 @@ impl<'a> Reader<'a> {
                             let objects: BTreeMap<(u32, u16), Object> = obj_stream
                                 .objects
                                 .into_iter()
-                                .filter(|((obj_num, _), _)| {
-                                    compressed_obj_containers
-                                        .get(obj_num)
-                                        .is_none_or(|&c| c == container_id)
-                                })
+                                .filter(|((obj_num, _), _)| keeps_member(obj_num, container_id))
                                 .filter_map(|(object_id, mut object)| filter_func(object_id, &mut object))
                                 .collect();
                             object_streams.extend(objects);
                         } else {
-                            object_streams.extend(obj_stream.objects.into_iter().filter(|((obj_num, _), _)| {
-                                compressed_obj_containers
-                                    .get(obj_num)
-                                    .is_none_or(|&c| c == container_id)
-                            }));
+                            object_streams.extend(
+                                obj_stream
+                                    .objects
+                                    .into_iter()
+                                    .filter(|((obj_num, _), _)| keeps_member(obj_num, container_id)),
+                            );
                         }
                     } else if stream.content.is_empty() {
                         let mut zero_length_streams = zero_length_streams.lock().unwrap();
@@ -1381,9 +1384,11 @@ impl<'a> Reader<'a> {
                 return Err(Error::Xref(XrefError::PrevStart));
             }
 
-            let (_, prev_xref, mut prev_trailer) = self.xref_and_trailer_at(prev as usize)?;
+            // Complete the older section with its own `/XRefStm` first: only within a section may a
+            // stream entry replace a free table entry.
+            let (_, mut prev_xref, mut prev_trailer) = self.xref_and_trailer_at(prev as usize)?;
+            self.merge_hybrid_xref_stream(&mut prev_xref, prev_trailer.remove(b"XRefStm"))?;
             xref.merge(prev_xref);
-            self.merge_hybrid_xref_stream(&mut xref, prev_trailer.remove(b"XRefStm"))?;
 
             prev_xref_start = prev_trailer.remove(b"Prev");
         }
@@ -1400,7 +1405,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Merge the cross-reference stream that a section of a hybrid-reference file points to
-    /// with `/XRefStm`. Its entries come after the section's table and before older sections.
+    /// with `/XRefStm` into that section's own table, before older sections are merged.
     fn merge_hybrid_xref_stream(&mut self, xref: &mut Xref, xref_stream_start: Option<Object>) -> Result<()> {
         let Some(start) = xref_stream_start.and_then(|offset| offset.as_i64().ok()) else {
             return Ok(());
@@ -1409,7 +1414,7 @@ impl<'a> Reader<'a> {
             return Err(Error::Xref(XrefError::StreamStart));
         }
         match self.xref_and_trailer_at(start as usize) {
-            Ok((_, stream_xref, _)) => xref.merge(stream_xref),
+            Ok((_, stream_xref, _)) => xref.merge_hybrid_stream(stream_xref),
             // The table alone still describes a hybrid-reference file for older readers.
             Err(e) if !self.strict => warn!("ignoring unreadable cross-reference stream at {start}: {e}"),
             Err(e) => return Err(e),
@@ -2329,6 +2334,13 @@ fn object_marker_parsing_accepts_only_real_headers() {
 /// `xref` table.
 #[cfg(all(test, not(feature = "async")))]
 fn hybrid_reference_file() -> (Vec<u8>, usize) {
+    hybrid_reference_file_with_table("0 2\n0000000000 65535 f \n{o1} 00000 n \n")
+}
+
+/// [`hybrid_reference_file`] with the `xref` table's subsections given by `table`, in which
+/// `{o1}` stands for the offset of object 1.
+#[cfg(all(test, not(feature = "async")))]
+fn hybrid_reference_file_with_table(table: &str) -> (Vec<u8>, usize) {
     let header = "%PDF-1.5\n";
     let obj1 = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
     let pages = "<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
@@ -2360,13 +2372,11 @@ fn hybrid_reference_file() -> (Vec<u8>, usize) {
     buffer.extend_from_slice(b"\nendstream\nendobj\n");
 
     let xref_pos = buffer.len();
+    let table = table.replace("{o1}", &format!("{o1:010}"));
     buffer.extend_from_slice(
         format!(
             "xref
-0 2
-0000000000 65535 f 
-{o1:010} 00000 n 
-trailer
+{table}trailer
 << /Size 6 /Root 1 0 R /XRefStm {o5} >>
 startxref
 {xref_pos}
@@ -2376,6 +2386,111 @@ startxref
         .as_bytes(),
     );
     (buffer, xref_pos)
+}
+
+/// Appends an incremental update to `buffer` whose only change is to free object 3, using a
+/// classic `xref` table, and returns the updated file.
+#[cfg(all(test, not(feature = "async")))]
+fn free_object_3_with_table(mut buffer: Vec<u8>, prev: usize) -> Vec<u8> {
+    let xref_pos = buffer.len();
+    buffer.extend_from_slice(
+        format!(
+            "xref
+3 1
+0000000000 00001 f
+trailer
+<< /Size 6 /Root 1 0 R /Prev {prev} >>
+startxref
+{xref_pos}
+%%EOF
+"
+        )
+        .as_bytes(),
+    );
+    buffer
+}
+
+/// A classic-table file whose object 3 is a dictionary nothing refers to. Returns the file and
+/// the offset of its `xref` table.
+#[cfg(all(test, not(feature = "async")))]
+fn classic_file_with_object_3() -> (Vec<u8>, usize) {
+    let header = "%PDF-1.4\n";
+    let objects = [
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n",
+        "3 0 obj\n<< /Marker (freed by a later update) >>\nendobj\n",
+    ];
+    let mut buffer = header.as_bytes().to_vec();
+    let mut table = String::from("xref\n0 4\n0000000000 65535 f \n");
+    for object in objects {
+        table.push_str(&format!("{:010} 00000 n \n", buffer.len()));
+        buffer.extend_from_slice(object.as_bytes());
+    }
+    let xref_pos = buffer.len();
+    buffer.extend_from_slice(
+        format!("{table}trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n").as_bytes(),
+    );
+    (buffer, xref_pos)
+}
+
+#[cfg(all(test, not(feature = "async")))]
+#[test]
+fn object_freed_by_a_later_table_stays_freed() {
+    let (buffer, prev) = classic_file_with_object_3();
+    assert!(Document::load_mem(&buffer).unwrap().get_object((3, 0)).is_ok());
+
+    let updated = free_object_3_with_table(buffer, prev);
+    let loaded = Document::load_mem(&updated).unwrap();
+    assert!(loaded.get_object((3, 0)).is_err(), "the freed object came back");
+}
+
+#[cfg(all(test, not(feature = "async")))]
+#[test]
+fn object_freed_by_a_later_xref_stream_stays_freed() {
+    let (mut buffer, prev) = classic_file_with_object_3();
+
+    // The update is a cross-reference stream, object 4: a type 0 (free) entry for object 3 and a
+    // type 1 entry for itself, with /W [1 2 1].
+    let o4 = buffer.len();
+    let [o4_hi, o4_lo] = u16::try_from(o4).unwrap().to_be_bytes();
+    let entries = [0, 0, 0, 1, 1, o4_hi, o4_lo, 0];
+    buffer.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /Prev {prev} /Index [3 2] /W [1 2 1] /Length {} >>\nstream\n",
+            entries.len()
+        )
+        .as_bytes(),
+    );
+    buffer.extend_from_slice(&entries);
+    buffer.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{o4}\n%%EOF\n").as_bytes());
+
+    let loaded = Document::load_mem(&buffer).unwrap();
+    assert!(loaded.get_object((3, 0)).is_err(), "the freed object came back");
+}
+
+#[cfg(all(test, not(feature = "async")))]
+#[test]
+fn hybrid_stream_entries_replace_free_table_entries_of_their_section() {
+    // The table lists the page tree's objects, which live in the object stream, as free so that
+    // older readers skip them; the section's /XRefStm says where they really are.
+    let (buffer, _) = hybrid_reference_file_with_table(
+        "0 4\n0000000000 65535 f \n{o1} 00000 n \n0000000000 00000 f \n0000000000 00000 f \n",
+    );
+
+    let loaded = Document::load_mem(&buffer).unwrap();
+    assert_eq!(loaded.get_pages().len(), 1);
+}
+
+#[cfg(all(test, not(feature = "async")))]
+#[test]
+fn later_free_entry_hides_an_object_of_an_older_hybrid_section() {
+    // Only the section's own table entries give way to its /XRefStm, not a newer section's.
+    let (buffer, prev) = hybrid_reference_file();
+    assert!(Document::load_mem(&buffer).unwrap().get_object((3, 0)).is_ok());
+
+    let updated = free_object_3_with_table(buffer, prev);
+    let loaded = Document::load_mem(&updated).unwrap();
+    assert!(loaded.get_object((3, 0)).is_err(), "the freed object came back");
 }
 
 #[cfg(all(test, not(feature = "async")))]
