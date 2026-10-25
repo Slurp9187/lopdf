@@ -829,7 +829,9 @@ impl<'a> Reader<'a> {
                 }
 
                 if let Ok((id, mut obj)) = self.parse_raw_object(raw_bytes) {
-                    let _ = encryption::decrypt_object(state, *obj_id, &mut obj);
+                    // An object that fails to decrypt fails the load: keeping it would leave
+                    // ciphertext in a document that no longer says it is encrypted.
+                    encryption::decrypt_object(state, *obj_id, &mut obj)?;
                     self.document.objects.insert(id, obj);
                 }
             }
