@@ -809,15 +809,15 @@ fn inline_image_impl(input: ParserInput) -> NomResult<(Vec<Object>, String)> {
             // Skip to EI marker so the rest of the content stream can still be parsed.
             log::warn!("Skipping unparseable inline image: {e}");
             let bytes = input;
-            // EI must appear after whitespace to distinguish from data bytes.
+            // EI must appear after whitespace to distinguish from data bytes, and be followed
+            // by whitespace or the end of the stream.
             let ei_pos = bytes
-                .windows(4)
-                .position(|w| {
-                    (w[0] == b' ' || w[0] == b'\n' || w[0] == b'\r')
-                        && w[1] == b'E'
-                        && w[2] == b'I'
-                        && (w[3] == b' ' || w[3] == b'\n' || w[3] == b'\r')
+                .windows(3)
+                .enumerate()
+                .find(|&(i, w)| {
+                    is_whitespace(w[0]) && w[1..] == *b"EI" && bytes.get(i + 3).is_none_or(|&c| is_whitespace(c))
                 })
+                .map(|(i, _)| i)
                 .ok_or_else(|| {
                     let err: NomError = nom::error::Error::from_error_kind(input, ErrorKind::Fail);
                     nom::Err::Failure(err)
@@ -840,8 +840,12 @@ fn image_data_stream(input: ParserInput, stream_dict: Dictionary) -> crate::Resu
     };
     let width = get_size(b"W", b"Width")?;
     let height = get_size(b"H", b"Height")?;
-    let bpc = get_size(b"BPC", b"BitsPerComponent")?;
     let im = get_abbr(b"IM", b"ImageMask").and_then(|x| x.as_bool());
+    let bpc = match get_size(b"BPC", b"BitsPerComponent") {
+        // An image mask has one bit per sample, so BitsPerComponent is optional for it.
+        Err(Error::DictKey(_)) if matches!(im, Ok(true)) => 1,
+        bpc => bpc?,
+    };
     let num_colors = match im {
         // If we have an image mask then we don't have a colorspace
         Ok(true) => 1,
@@ -1281,6 +1285,23 @@ EI
     }
 
     #[test]
+    fn inline_image_skipped_to_ei_after_any_white_space() {
+        // Filters aren't decoded yet, so an image with one is skipped by looking for EI.
+        // Any white-space character can delimit EI, and the stream can end right after it.
+        for (end, expected) in [
+            (&b"\tEI\tQ"[..], &["q", "BI", "Q"][..]),
+            (b"\x0cEI\x00Q", &["q", "BI", "Q"]),
+            (b" EI", &["q", "BI"]),
+        ] {
+            let mut input = b"q BI /W 1 /H 1 /BPC 8 /CS /G /F /AHx ID 00>".to_vec();
+            input.extend_from_slice(end);
+            let out = content_strict(test_span(&input)).unwrap();
+            let ops: Vec<&str> = out.operations.iter().map(|o| o.operator.as_str()).collect();
+            assert_eq!(ops, expected, "stream: {:?}", String::from_utf8_lossy(&input));
+        }
+    }
+
+    #[test]
     fn inline_image() {
         let _ = env_logger::try_init();
         let input = b"BI /W 4 /H 4 /CS /RGB /BPC 8
@@ -1315,6 +1336,21 @@ EI";
             assert_eq!(ops, vec!["q", "BI", "Q"]);
             let image = out.operations[1].operands[0].as_stream().unwrap();
             assert_eq!(image.content, data);
+        }
+    }
+
+    #[test]
+    fn inline_image_mask_without_bits_per_component() {
+        // A 9x2 image mask: one bit per sample, each row padded to two bytes.
+        for image_mask in [&b"/IM true"[..], b"/ImageMask true"] {
+            let mut input = b"q BI ".to_vec();
+            input.extend_from_slice(image_mask);
+            input.extend_from_slice(b" /W 9 /H 2 ID \x80\x00\xff\x80 EI Q");
+            let out = content(test_span(&input)).unwrap();
+            let ops: Vec<&str> = out.operations.iter().map(|o| o.operator.as_str()).collect();
+            assert_eq!(ops, vec!["q", "BI", "Q"]);
+            let image = out.operations[1].operands[0].as_stream().unwrap();
+            assert_eq!(image.content, b"\x80\x00\xff\x80");
         }
     }
 
