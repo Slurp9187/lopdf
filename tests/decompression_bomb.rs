@@ -370,3 +370,70 @@ fn total_decompressed_size_is_bounded_across_streams() {
         Ok(_) => panic!("the total was not bounded"),
     }
 }
+
+/// A file whose objects all sit after an inserted line: its table reads, nothing it points
+/// at loads, and lenient loading rebuilds the table by scanning (upstream #636). The rebuilt
+/// load decodes an object stream the first load never reached.
+fn shifted_pdf_with_object_stream(padding: usize) -> Vec<u8> {
+    let mut members = b"10 0 ".to_vec();
+    let first = members.len();
+    members.extend_from_slice(format!("<< /Pad ({}) >>", "a".repeat(padding)).as_bytes());
+    let compressed = zlib_compress(&members);
+
+    let mut pdf = b"%PDF-1.5\n".to_vec();
+    let mut offsets = Vec::new();
+    for (number, body) in [
+        (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>".to_string()),
+    ] {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Type /ObjStm /N 1 /First {first} /Filter /FlateDecode /Length {} >>\nstream\n",
+            compressed.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(&compressed);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let inserted = b"% a line added after the cross-reference table was written\n";
+    pdf.splice(9..9, inserted.iter().copied());
+
+    let startxref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes());
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n").as_bytes());
+    pdf
+}
+
+/// The total bounds the load that rebuilds the cross-reference table too: that load decodes
+/// streams again, and a limit it reaches fails the load rather than falling back to the
+/// table that missed its objects. Measured before the fix: the rebuild ran with no total and
+/// the load succeeded.
+#[test]
+fn the_total_bounds_a_rebuilt_load() {
+    let pdf = shifted_pdf_with_object_stream(4096);
+    let document = Document::load_mem_with_options(&pdf, LoadOptions::default()).unwrap();
+    assert_eq!(document.get_pages().len(), 1, "the rebuild should find the page tree");
+    assert!(
+        document.objects.contains_key(&(10, 0)),
+        "the rebuild should decode the object stream"
+    );
+
+    let options = LoadOptions {
+        max_total_decompressed_size: Some(1024),
+        ..LoadOptions::default()
+    };
+    match Document::load_mem_with_options(&pdf, options) {
+        Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => assert_eq!(limit, 1024),
+        Err(other) => panic!("expected MemoryLimitExceeded, got {other:?}"),
+        Ok(_) => panic!("the rebuilt load was not bounded by the total"),
+    }
+}
