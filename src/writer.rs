@@ -5,7 +5,7 @@ use std::vec;
 
 use super::Object::*;
 use super::{Dictionary, Document, Object, Stream, StringFormat};
-use crate::encryption;
+use crate::encryption::{self, EncryptionState};
 use crate::{IncrementalDocument, xref::*};
 
 impl Document {
@@ -43,21 +43,73 @@ impl Document {
             ));
         }
         let style = Style::new(&options);
+        self.select_xref_type(&options);
+        if options.use_object_streams {
+            self.save_with_object_streams(target, options, style, None)
+        } else {
+            self.save_internal(target, style)
+        }
+    }
 
-        // Xref streams and object streams are independent; select the requested type here so it
-        // applies to whichever path writes the body. Both arrived in PDF 1.5, so bump the version.
+    /// Encrypt the document as it is written, with the object streams `options` asks for.
+    ///
+    /// [`Document::encrypt`] encrypts every object in place and drops the key, so a later save
+    /// can only write the objects one by one: an object stream built then would go out in the
+    /// clear. Here each object is encrypted as it is written, and an object stream is packed
+    /// from plaintext and then encrypted as a whole, as a reader expects (the objects inside it
+    /// are not encrypted on their own). The document itself is left unencrypted; the `/Encrypt`
+    /// dictionary and a cross-reference stream are written unencrypted, as they must be.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`std::io::ErrorKind::InvalidInput`] when [`SaveOptions::ascii`](crate::SaveOptions::ascii)
+    /// is set, before anything is written, as [`Document::save_with_options`] does for an
+    /// encrypted document.
+    pub fn save_encrypted<W: Write>(
+        &mut self, target: &mut W, state: &EncryptionState, options: crate::SaveOptions,
+    ) -> crate::Result<()> {
+        if self.is_encrypted() {
+            return Err(crate::Error::AlreadyEncrypted);
+        }
+        // As in `save_with_options`: a reader decrypts a stream before its filters apply.
+        if options.ascii {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "an encrypted document cannot be saved as ASCII: its streams are decrypted before their filters apply",
+            )
+            .into());
+        }
+        let style = Style::new(&options);
+        // `/Encrypt` takes the number after `max_id` for this save only, so the streams the
+        // writer generates are numbered after it, and the document keeps its `max_id` (#633).
+        let max_id = self.max_id;
+        let encrypt = Encrypt {
+            state,
+            dictionary: state.encode()?,
+            id: self.try_new_object_id()?,
+        };
+        self.select_xref_type(&options);
+        // The trailer names `/Encrypt` only while writing, so the document stays unencrypted.
+        self.trailer.set(b"Encrypt", Reference(encrypt.id));
+        let saved = if options.use_object_streams {
+            self.save_with_object_streams(target, options, style, Some(&encrypt))
+        } else {
+            self.save_internal_encrypted(target, style, Some(&encrypt))
+        };
+        self.trailer.remove(b"Encrypt");
+        self.max_id = max_id;
+        Ok(saved?)
+    }
+
+    /// Xref streams and object streams are independent; select the requested type here so it
+    /// applies to whichever path writes the body. Both arrived in PDF 1.5, so bump the version.
+    fn select_xref_type(&mut self, options: &crate::SaveOptions) {
         if options.use_xref_streams {
             self.reference_table.cross_reference_type = XrefType::CrossReferenceStream;
 
             if self.version.as_str() < "1.5" {
                 self.version = "1.5".to_string();
             }
-        }
-
-        if options.use_object_streams {
-            self.save_with_object_streams(target, options, style)
-        } else {
-            self.save_internal(target, style)
         }
     }
 
@@ -67,7 +119,8 @@ impl Document {
     /// encrypted by the time they reach the writer and the file encryption key is gone,
     /// so an object stream built here could only be written in the clear, contradicting
     /// the document's `/Encrypt` dictionary. The requested cross-reference type is still
-    /// used; cross-reference streams are never encrypted.
+    /// used; cross-reference streams are never encrypted. To encrypt with object streams, see
+    /// [`Document::save_encrypted`].
     pub fn save_modern<W: Write>(&mut self, target: &mut W) -> Result<()> {
         let options = crate::SaveOptions {
             use_object_streams: true,
@@ -86,6 +139,13 @@ impl Document {
     }
 
     fn save_internal<W: Write>(&mut self, target: &mut W, style: Style) -> Result<()> {
+        self.save_internal_encrypted(target, style, None)
+    }
+
+    /// The plain save, with every object encrypted as it is written when `encrypt` is given.
+    fn save_internal_encrypted<W: Write>(
+        &mut self, target: &mut W, style: Style, encrypt: Option<&Encrypt>,
+    ) -> Result<()> {
         // A plain save uses the document's existing xref format, including the default stream.
         if matches!(
             self.reference_table.cross_reference_type,
@@ -102,10 +162,13 @@ impl Document {
         let mut xref = Xref::new(self.max_id.saturating_add(1), self.reference_table.cross_reference_type);
         self.write_header(&mut target, style)?;
 
-        for (&(id, generation), object) in &self.objects {
+        for (&id, object) in &self.objects {
             if !Self::is_regenerated_on_save(object) {
-                Writer::write_indirect_object(&mut target, id, generation, object, &mut xref, style)?;
+                write_maybe_encrypted(&mut target, id, object, &mut xref, style, encrypt)?;
             }
+        }
+        if let Some(encrypt) = encrypt {
+            encrypt.write_dictionary(&mut target, &mut xref, style)?;
         }
 
         let xref_start = target.bytes_written;
@@ -166,7 +229,7 @@ impl Document {
 
     /// Save PDF with object streams enabled
     fn save_with_object_streams<W: Write>(
-        &mut self, target: &mut W, options: crate::SaveOptions, style: Style,
+        &mut self, target: &mut W, options: crate::SaveOptions, style: Style, encrypt: Option<&Encrypt>,
     ) -> Result<()> {
         use crate::ObjectStream;
         use std::collections::HashMap;
@@ -179,7 +242,8 @@ impl Document {
         // An object stream would go out unencrypted: `Document::encrypt` already dropped the key,
         // and the strings packed inside are themselves already encrypted (an object stream is the
         // unit of encryption). Write the objects out individually instead, as `save` does.
-        if self.is_encrypted() {
+        // `save_encrypted` packs the objects before it encrypts them, so it keeps object streams.
+        if encrypt.is_none() && self.is_encrypted() {
             return self.save_internal(target, style);
         }
 
@@ -207,7 +271,10 @@ impl Document {
                 continue; // Skip existing object streams
             }
 
-            if generation == 0 && ObjectStream::can_be_compressed((id, generation), object, self) {
+            // A signature's /Contents must stay unencrypted, which it cannot inside an encrypted
+            // object stream: write a signature dictionary on its own.
+            let keep_out = encrypt.is_some() && is_signature(object);
+            if generation == 0 && !keep_out && ObjectStream::can_be_compressed((id, generation), object, self) {
                 // Object can be compressed
                 // Find or create an object stream for it
                 let stream_index = object_streams.len().saturating_sub(1);
@@ -236,8 +303,11 @@ impl Document {
         }
 
         // Write direct objects first
-        for ((id, generation), object) in objects_to_write_directly {
-            Writer::write_indirect_object(&mut target, id, generation, object, &mut xref, style)?;
+        for (id, object) in objects_to_write_directly {
+            write_maybe_encrypted(&mut target, id, object, &mut xref, style, encrypt)?;
+        }
+        if let Some(encrypt) = encrypt {
+            encrypt.write_dictionary(&mut target, &mut xref, style)?;
         }
 
         // Write object streams
@@ -260,8 +330,15 @@ impl Document {
                 );
             }
 
-            // Write the object stream
-            Writer::write_indirect_object(&mut target, stream_id, 0, &Object::Stream(stream_obj), &mut xref, style)?;
+            // Write the object stream, encrypted as a whole when the document is.
+            write_maybe_encrypted(
+                &mut target,
+                (stream_id, 0),
+                &Object::Stream(stream_obj),
+                &mut xref,
+                style,
+                encrypt,
+            )?;
         }
 
         let xref_start = target.bytes_written;
@@ -323,6 +400,45 @@ impl Document {
         file.write_all(b"trailer\n")?;
         Writer::write_dictionary(file, &trailer, style)?;
         Ok(())
+    }
+}
+
+/// What [`Document::save_encrypted`] encrypts with, and the `/Encrypt` dictionary it writes.
+struct Encrypt<'a> {
+    state: &'a EncryptionState,
+    dictionary: Dictionary,
+    id: crate::ObjectId,
+}
+
+impl Encrypt<'_> {
+    fn write_dictionary<W: Write>(
+        &self, target: &mut CountingWrite<&mut W>, xref: &mut Xref, style: Style,
+    ) -> Result<()> {
+        let dictionary = Object::Dictionary(self.dictionary.clone());
+        Writer::write_indirect_object(target, self.id.0, self.id.1, &dictionary, xref, style)
+    }
+}
+
+/// A signature dictionary: `/Type /Sig` or `/DocTimeStamp`, or a `/ByteRange` beside `/Contents`.
+fn is_signature(object: &Object) -> bool {
+    let Object::Dictionary(dict) = object else {
+        return false;
+    };
+    dict.has_type(b"Sig") || dict.has_type(b"DocTimeStamp") || (dict.has(b"ByteRange") && dict.has(b"Contents"))
+}
+
+/// Write `object`, first encrypted under its own id when `encrypt` is given.
+fn write_maybe_encrypted<W: Write>(
+    target: &mut CountingWrite<&mut W>, id: crate::ObjectId, object: &Object, xref: &mut Xref, style: Style,
+    encrypt: Option<&Encrypt>,
+) -> Result<()> {
+    match encrypt {
+        Some(encrypt) => {
+            let mut object = object.clone();
+            encryption::encrypt_object(encrypt.state, id, &mut object).map_err(std::io::Error::other)?;
+            Writer::write_indirect_object(target, id.0, id.1, &object, xref, style)
+        }
+        None => Writer::write_indirect_object(target, id.0, id.1, object, xref, style),
     }
 }
 

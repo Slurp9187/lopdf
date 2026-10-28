@@ -11,6 +11,7 @@
 * Decrypt embedded file streams with the `/EFF` crypt filter, which was ignored: an embedded file is a stream a file specification's `/EF` names, or one with `/Type /EmbeddedFile`, and a stream's own `/Crypt` filter still wins
 * Write `/Length 256` in a V5 `/Encrypt` dictionary and `/Length 32` in an AESV3 crypt filter, which LibreOffice needs to show an AES-256 document's pages
 * Hold a real as an `f64`, so a value such as `595.303937007874` is saved as it was read instead of rounded to `595.30396`. `Object::Real` now holds an `f64`; `as_f64` is new, and `as_f32` and `as_float` still return an `f32`
+* Add `Document::save_encrypted`, which encrypts while it writes, so an encrypted document can keep object streams: each object stream is packed from plaintext and encrypted as a whole. `encrypt` followed by a save still writes every object on its own. A signature dictionary is kept out of object streams, so its `/Contents` stays unencrypted
 
 <a name="v0.45.0"></a>
 ## [v0.45.0](https://github.com/J-F-Liu/lopdf/compare/v0.44.0...v0.45.0) (2026-09-08)
