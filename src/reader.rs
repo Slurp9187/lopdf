@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use zeroize::Zeroize;
 
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
@@ -386,6 +387,15 @@ const MIN_PARALLEL_ENTRIES: usize = 16;
 #[cfg(feature = "rayon")]
 const MIN_PARALLEL_BYTES: usize = 1 << 20;
 
+impl Drop for Reader<'_> {
+    /// Wipes the password, whichever way the read ended.
+    fn drop(&mut self) {
+        if let Some(password) = self.password.as_mut() {
+            password.zeroize();
+        }
+    }
+}
+
 /// Maximum allowed embedding of literal strings.
 pub const MAX_BRACKET: usize = 100;
 
@@ -506,10 +516,9 @@ impl<'a> Reader<'a> {
     /// The metadata-only loaders accept a password but never the strictness,
     /// filter or decompression-limit knobs, so they use their own defaults.
     fn for_metadata(buffer: &'a [u8], password: Option<String>) -> Self {
-        Self {
-            password,
-            ..Self::new(buffer)
-        }
+        let mut reader = Self::new(buffer);
+        reader.password = password;
+        reader
     }
 
     fn with_options(buffer: &'a [u8], options: LoadOptions) -> Self {
@@ -800,7 +809,7 @@ impl<'a> Reader<'a> {
             }
         }
 
-        Ok(self.document)
+        Ok(std::mem::take(&mut self.document))
     }
 
     /// Resolve the cross-reference data and trailer, or rebuild them by scanning for indirect
@@ -899,7 +908,7 @@ impl<'a> Reader<'a> {
 
         self.parse_encryption_dictionary()?;
 
-        if self.authenticate_and_setup_encryption(false)?.is_none() {
+        if !self.authenticate_and_setup_encryption(false)? {
             return Ok(());
         }
 
@@ -1297,12 +1306,14 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    fn authenticate_and_setup_encryption(&mut self, require_password: bool) -> Result<Option<String>> {
-        let password_to_use: Option<String> = if self.document.authenticate_password("").is_ok() {
-            Some(String::new())
-        } else if let Some(ref pwd) = self.password {
+    /// Returns whether decryption was set up. The password is borrowed, never copied: the
+    /// reader wipes its own copy when it drops.
+    fn authenticate_and_setup_encryption(&mut self, require_password: bool) -> Result<bool> {
+        let password: &str = if self.document.authenticate_password("").is_ok() {
+            ""
+        } else if let Some(pwd) = self.password.as_deref() {
             if self.document.authenticate_password(pwd).is_ok() {
-                Some(pwd.clone())
+                pwd
             } else if require_password {
                 return Err(Error::InvalidPassword);
             } else {
@@ -1315,21 +1326,20 @@ impl<'a> Reader<'a> {
             ));
         } else {
             warn!("PDF is encrypted and requires a password");
-            return Ok(None);
+            return Ok(false);
         };
 
-        if let Some(ref password) = password_to_use {
-            // Derive the key from the same sanitized bytes `authenticate_password` checked.
-            let password = PasswordAlgorithm::try_from(&self.document)?.sanitize_password(password)?;
-            let state = EncryptionState::decode(&self.document, &password)?;
-            self.encryption_state = Some(state);
-            // Containers decoded before decryption was set up hold ciphertext.
-            if let Ok(cache) = self.object_streams.get_mut() {
-                cache.clear();
-            }
+        // Derive the key from the same sanitized bytes `authenticate_password` checked.
+        let password =
+            zeroize::Zeroizing::new(PasswordAlgorithm::try_from(&self.document)?.sanitize_password(password)?);
+        let state = EncryptionState::decode(&self.document, &*password)?;
+        self.encryption_state = Some(state);
+        // Containers decoded before decryption was set up hold ciphertext.
+        if let Ok(cache) = self.object_streams.get_mut() {
+            cache.clear();
         }
 
-        Ok(password_to_use)
+        Ok(true)
     }
 
     fn setup_encryption_for_metadata(&mut self) -> Result<()> {
@@ -2781,11 +2791,10 @@ fn load_on_both_paths(buffer: &[u8], strict: bool) -> [Result<Document>; 2] {
             strict,
             ..Default::default()
         };
-        Reader {
-            parallel: Some(parallel),
-            ..Reader::with_options(buffer, options)
-        }
-        .read(None)
+        // Not struct-update syntax: `Reader` implements `Drop`.
+        let mut reader = Reader::with_options(buffer, options);
+        reader.parallel = Some(parallel);
+        reader.read(None)
     })
 }
 
