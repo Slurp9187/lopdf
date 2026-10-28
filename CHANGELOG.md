@@ -1,7 +1,7 @@
 
 <a name="unreleased"></a>
 ## [Unreleased](https://github.com/J-F-Liu/lopdf/compare/v0.45.0...HEAD)
-* Keep free cross-reference entries, so an object freed by an incremental update stays freed instead of reviving an older revision's copy or an object-stream copy; within a hybrid-reference section, the `/XRefStm` entry replaces a free table entry. The parsed `Xref` now holds `Free` and `UnusableFree` entries
+* An object freed by an incremental update stays freed when its older copy lives in an object stream, rather than being recovered from the stream; a free entry of generation 65535 is kept as `UnusableFree`, and a cross-reference stream entry of an unknown type hides an older section's entry as a free one does
 
 <a name="v0.45.0"></a>
 ## [v0.45.0](https://github.com/J-F-Liu/lopdf/compare/v0.44.0...v0.45.0) (2026-09-08)
