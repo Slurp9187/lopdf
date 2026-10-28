@@ -76,6 +76,9 @@ impl Xref {
 
     /// Combine Xref entries. Only add them if they do not exists already.
     /// Do not replace existing entries.
+    ///
+    /// `self` holds the newer section, so its entries win, free entries included: an object
+    /// freed by an incremental update stays freed rather than reviving an older revision's copy.
     pub fn merge(&mut self, xref: Xref) {
         for (id, entry) in xref.entries {
             self.entries.entry(id).or_insert(entry);
@@ -107,6 +110,16 @@ impl Xref {
 }
 
 impl XrefEntry {
+    /// A free entry with generation `generation`. Generation 65535 marks an entry that can never
+    /// be reused.
+    pub fn free(generation: u32) -> XrefEntry {
+        if generation == 65535 {
+            XrefEntry::UnusableFree
+        } else {
+            XrefEntry::Free
+        }
+    }
+
     pub fn is_normal(&self) -> bool {
         matches!(*self, XrefEntry::Normal { .. })
     }

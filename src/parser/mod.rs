@@ -657,14 +657,14 @@ fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
             |mut xref, ((start, _count), entries)| {
                 let mut skipped = 0usize;
                 for (index, ((offset, generation), is_normal)) in entries.into_iter().enumerate() {
-                    // A free entry is kept too: in an incremental update it deletes the object
-                    // that an older section still lists.
-                    let entry = if !is_normal {
-                        XrefEntry::Free
-                    } else if let Ok(generation) = generation.try_into() {
-                        XrefEntry::Normal { offset, generation }
+                    // Free entries are kept: they hide an older section's entry for the same object.
+                    let entry = if is_normal {
+                        match generation.try_into() {
+                            Ok(generation) => XrefEntry::Normal { offset, generation },
+                            Err(_) => continue,
+                        }
                     } else {
-                        continue;
+                        XrefEntry::free(generation)
                     };
                     // `start` is untrusted: `start + index` can overflow, and a `start`
                     // above u32::MAX would truncate into a valid-looking object number.
@@ -997,6 +997,11 @@ mod tests {
 
     fn test_span(s: &'_ [u8]) -> ParserInput<'_> {
         s
+    }
+
+    /// The in-use entries of `xref`; free entries, object 0 among them, are recorded too.
+    fn normal_entries(xref: &Xref) -> usize {
+        xref.entries.values().filter(|entry| entry.is_normal()).count()
     }
 
     fn tstrip<O>(r: NomResult<O>) -> Option<O> {
@@ -1418,7 +1423,7 @@ EI";
         let input =
             b"xref\n0 3\n0000000000 65535 f\n0000000017 00000 n\n0000000081 00000 n\ntrailer\n<</Size 3/Root 1 0 R>>\n";
         if let Ok((_, re)) = xref(test_span(input), true) {
-            assert_eq!(re.entries.len(), 0, "strict must not accept 19-byte entries");
+            assert_eq!(normal_entries(&re), 0, "strict must not accept 19-byte entries");
         }
 
         // The 20-byte build of the same document is the control: it must load in both
