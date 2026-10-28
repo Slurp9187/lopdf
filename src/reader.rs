@@ -7,6 +7,7 @@ use std::fs::File;
 #[cfg(not(feature = "async"))]
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroize;
 
@@ -352,6 +353,11 @@ pub struct Reader<'a> {
     /// `None` (the default) applies no limit; set it to guard against
     /// decompression bombs. See [`crate::LoadOptions`].
     pub max_decompressed_size: Option<usize>,
+    /// Maximum decompressed size, in bytes, of all the streams decoded during
+    /// loading together. See [`crate::LoadOptions::max_total_decompressed_size`].
+    pub max_total_decompressed_size: Option<usize>,
+    /// What the streams decoded so far came to. Atomic: objects load in parallel.
+    decompressed_total: AtomicUsize,
     /// Rebuild the cross-reference table by scanning before reading it as written. See
     /// [`LoadOptions::force_reconstruct`].
     pub force_reconstruct: bool,
@@ -529,6 +535,8 @@ impl<'a> Reader<'a> {
             password: options.password,
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
+            max_total_decompressed_size: options.max_total_decompressed_size,
+            decompressed_total: AtomicUsize::new(0),
             force_reconstruct: options.force_reconstruct,
             normal_offsets: Vec::new(),
             object_streams: Mutex::default(),
@@ -792,18 +800,27 @@ impl<'a> Reader<'a> {
             && self.should_rebuild(self.document.xref_recovery)
             && !Self::page_tree_loaded(&self.document)
         {
+            // The rebuilt load decodes streams again, so it gets what is left of the total.
             let options = LoadOptions {
                 password: self.password.clone(),
                 max_decompressed_size: self.max_decompressed_size,
+                max_total_decompressed_size: self
+                    .max_total_decompressed_size
+                    .map(|total| total.saturating_sub(self.decompressed_total.load(Ordering::SeqCst))),
                 force_reconstruct: true,
                 ..LoadOptions::default()
             };
-            if let Ok(rebuilt) = Reader::with_options(self.buffer, options).read(None)
-                && rebuilt.xref_recovery == Some(XrefRecovery::Reconstructed)
-                && Self::page_tree_loaded(&rebuilt)
-            {
-                warn!("{UNREADABLE_PAGE_TREE}");
-                return Ok(rebuilt);
+            match Reader::with_options(self.buffer, options).read(None) {
+                Ok(rebuilt)
+                    if rebuilt.xref_recovery == Some(XrefRecovery::Reconstructed)
+                        && Self::page_tree_loaded(&rebuilt) =>
+                {
+                    warn!("{UNREADABLE_PAGE_TREE}");
+                    return Ok(rebuilt);
+                }
+                // A decompression limit is never skipped, here either.
+                Err(e) if is_decompression_limit(&e) => return Err(e),
+                _ => {}
             }
         }
 
@@ -948,7 +965,7 @@ impl<'a> Reader<'a> {
                 if let Some(container_obj) = self.document.objects.get(&(container_id, 0))
                     && let Ok(stream) = container_obj.as_stream()
                 {
-                    match ObjectStream::new_with_limit(stream, self.max_decompressed_size) {
+                    match self.decode_object_stream(stream) {
                         Ok(object_stream) => {
                             for (obj_num, _index) in objects_in_stream {
                                 let obj_id = (obj_num, 0);
@@ -1046,9 +1063,14 @@ impl<'a> Reader<'a> {
                             warn!("Skipping encrypted object at offset {}: {:?}", offset, e);
                             return Ok(None);
                         }
-                        // Lenient loading logs and skips malformed objects; strict loading fails.
+                        // Lenient loading logs and skips malformed objects; strict loading
+                        // fails. A decompression limit is never skipped.
                         error!("Object load error at offset {}: {e:?}", offset);
-                        return if self.strict { Err(e) } else { Ok(None) };
+                        return if self.strict || is_decompression_limit(&e) {
+                            Err(e)
+                        } else {
+                            Ok(None)
+                        };
                     }
                 };
                 if let Some(filter_func) = filter_func
@@ -1059,7 +1081,7 @@ impl<'a> Reader<'a> {
 
                 if let Ok(stream) = object.as_stream() {
                     if stream.dict.has_type(b"ObjStm") && !is_encrypted {
-                        let obj_stream = match ObjectStream::new_with_limit(stream, self.max_decompressed_size) {
+                        let obj_stream = match self.decode_object_stream(stream) {
                             Ok(obj_stream) => obj_stream,
                             // Resource limits apply even when malformed objects may be skipped.
                             Err(e @ Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => return Err(e),
@@ -1067,7 +1089,13 @@ impl<'a> Reader<'a> {
                             // strict-mode policy as any other load error.
                             Err(e) => {
                                 error!("Object stream load error for {object_id:?}: {e:?}");
-                                return if self.strict { Err(e) } else { Ok(None) };
+                                // A decompression limit fails the load in lenient mode
+                                // too: skipping the stream would drop its objects.
+                                return if self.strict || is_decompression_limit(&e) {
+                                    Err(e)
+                                } else {
+                                    Ok(None)
+                                };
                             }
                         };
                         let container_id = object_id.0;
@@ -1245,7 +1273,7 @@ impl<'a> Reader<'a> {
         }
         let decoded = self
             .get_object((container, 0), already_seen)
-            .and_then(|object| ObjectStream::new_with_limit(object.as_stream()?, self.max_decompressed_size))
+            .and_then(|object| self.decode_object_stream(object.as_stream()?))
             .map(Arc::new);
         if !matches!(decoded, Err(Error::ReferenceCycle(_))) {
             self.object_streams
@@ -2763,5 +2791,64 @@ fn sequential_and_parallel_loads_treat_a_malformed_object_alike() {
         assert!(!sequential.objects.contains_key(&page));
         assert_eq!(sequential.objects.len(), intact.objects.len() - 1);
         assert_same_document(&sequential, &parallel);
+    }
+}
+
+/// Whether `e` is a decompression limit the caller set
+/// (`LoadOptions::max_decompressed_size`). Such an error always fails a load,
+/// lenient or strict: it is the caller's bound on an untrusted file, not a
+/// malformed object to skip.
+fn is_decompression_limit(e: &Error) -> bool {
+    matches!(e, Error::Decompress(crate::DecompressError::MemoryLimitExceeded { .. }))
+}
+
+impl Reader<'_> {
+    /// The limit the next stream may decompress to: the per-stream one, or what
+    /// is left of the total, whichever is smaller.
+    pub(crate) fn stream_limit(&self) -> Option<usize> {
+        let left = self
+            .max_total_decompressed_size
+            .map(|total| total.saturating_sub(self.decompressed_total.load(Ordering::SeqCst)));
+        match (self.max_decompressed_size, left) {
+            (Some(one), Some(left)) => Some(one.min(left)),
+            (one, left) => one.or(left),
+        }
+    }
+
+    /// Count `bytes` a stream decompressed to toward the total, and fail the
+    /// load once the total is past its limit.
+    pub(crate) fn charge_decompressed(&self, bytes: usize) -> Result<()> {
+        let Some(total) = self.max_total_decompressed_size else {
+            return Ok(());
+        };
+        let before = self.decompressed_total.fetch_add(bytes, Ordering::SeqCst);
+        if before.saturating_add(bytes) > total {
+            return Err(crate::DecompressError::MemoryLimitExceeded { limit: total }.into());
+        }
+        Ok(())
+    }
+
+    /// A decode that failed under `limit`, a [`Self::stream_limit`], names the
+    /// caller's total when what was left of the total is what it ran into, not
+    /// the leftover (which can be 0).
+    pub(crate) fn total_limit_error(&self, limit: Option<usize>, e: Error) -> Error {
+        match (self.max_total_decompressed_size, &e) {
+            (Some(total), Error::Decompress(crate::DecompressError::MemoryLimitExceeded { .. }))
+                if limit != self.max_decompressed_size =>
+            {
+                crate::DecompressError::MemoryLimitExceeded { limit: total }.into()
+            }
+            _ => e,
+        }
+    }
+
+    /// Decode an object stream under [`Self::stream_limit`], counting it toward
+    /// the total.
+    fn decode_object_stream(&self, stream: &crate::Stream) -> Result<ObjectStream> {
+        let limit = self.stream_limit();
+        let (object_stream, decoded) =
+            ObjectStream::decode_with_limit(stream, limit).map_err(|e| self.total_limit_error(limit, e))?;
+        self.charge_decompressed(decoded)?;
+        Ok(object_stream)
     }
 }
