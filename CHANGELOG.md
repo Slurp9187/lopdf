@@ -6,6 +6,7 @@
 * Wipe the password a loader was given, and the sanitized and recovered passwords and intermediate keys derived from it, once they are no longer needed
 * Enable the `zeroize` features of `aes`, `cbc`, `ecb`, `md-5` and `sha2`, which wipe cipher key schedules and hash state
 * Treat `/Identity` and an absent `/StmF`, `/StrF` or stream `/Crypt` name as the Identity crypt filter from V4 on, instead of RC4; find a stream's `/Crypt` parameters in a `/DecodeParms` array; refuse a crypt filter name that is not in `/CF`. `get_stream_filter` and `get_string_filter` now return a `Result`
+* Keep free cross-reference entries, so an object freed by an incremental update stays freed instead of reviving an older revision's copy or an object-stream copy; within a hybrid-reference section, the `/XRefStm` entry replaces a free table entry. The parsed `Xref` now holds `Free` and `UnusableFree` entries
 
 <a name="v0.45.0"></a>
 ## [v0.45.0](https://github.com/J-F-Liu/lopdf/compare/v0.44.0...v0.45.0) (2026-09-08)
