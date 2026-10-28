@@ -60,6 +60,14 @@ impl ObjectStream {
     /// decoded content if it would exceed `max_decompressed_size` bytes. `None`
     /// means no limit (the behavior of [`ObjectStream::new`]).
     pub fn new_with_limit(stream: &Stream, max_decompressed_size: Option<usize>) -> Result<ObjectStream> {
+        Self::decode_with_limit(stream, max_decompressed_size).map(|(object_stream, _)| object_stream)
+    }
+
+    /// [`Self::new_with_limit`], and how many bytes the stream decompressed to,
+    /// for a loader that bounds the total across streams.
+    pub(crate) fn decode_with_limit(
+        stream: &Stream, max_decompressed_size: Option<usize>,
+    ) -> Result<(ObjectStream, usize)> {
         let content = match max_decompressed_size {
             // Object streams are decoded while the document is loaded, so
             // enforcing the limit here bounds the memory a single stream can use.
@@ -67,12 +75,16 @@ impl ObjectStream {
             None => stream.get_plain_content()?,
         };
 
+        let decoded = content.len();
         if content.is_empty() {
-            return Ok(ObjectStream {
-                objects: BTreeMap::new(),
-                max_objects: 100,
-                compression_level: 6,
-            });
+            return Ok((
+                ObjectStream {
+                    objects: BTreeMap::new(),
+                    max_objects: 100,
+                    compression_level: 6,
+                },
+                decoded,
+            ));
         }
 
         let first_offset = stream
@@ -125,11 +137,14 @@ impl ObjectStream {
         #[cfg(not(feature = "rayon"))]
         let objects = numbers[..len].chunks(2).filter_map(chunks_filter_map).collect();
 
-        Ok(ObjectStream {
-            objects,
-            max_objects: 100,
-            compression_level: 6,
-        })
+        Ok((
+            ObjectStream {
+                objects,
+                max_objects: 100,
+                compression_level: 6,
+            },
+            decoded,
+        ))
     }
 
     /// Create a builder for constructing new object streams
