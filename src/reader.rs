@@ -943,11 +943,9 @@ impl<'a> Reader<'a> {
                 }
 
                 if let Ok((id, mut obj)) = self.parse_raw_object(raw_bytes) {
-                    // Keep the partial object, but do not drop the error silently.
-                    if let Err(error) = encryption::decrypt_object(state, *obj_id, &mut obj) {
-                        log::warn!("object {obj_id:?} could not be fully decrypted: {error}");
-                    }
-
+                    // An object that fails to decrypt fails the load: keeping it would leave
+                    // ciphertext in a document that no longer says it is encrypted.
+                    encryption::decrypt_object(state, *obj_id, &mut obj)?;
                     self.document.objects.insert(id, obj);
                 }
             }
