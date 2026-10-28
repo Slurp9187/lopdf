@@ -7,6 +7,7 @@
 use super::DecryptionError;
 use super::pkcs5::Pkcs5;
 use super::rc4::Rc4Keystream;
+use aes::cipher::array::Array;
 use aes::cipher::consts::U16;
 use aes::cipher::{BlockModeDecrypt, BlockSizeUser, KeyIvInit};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -190,27 +191,65 @@ where
             return Ok(0);
         };
 
-        let mut written = 0;
-        while !input.is_empty() {
+        // Complete the block left over from the last chunk, if there is one.
+        let mut has_partial = false;
+        if self.partial_len > 0 {
             let n = (16 - self.partial_len).min(input.len());
             self.partial[self.partial_len..][..n].copy_from_slice(&input[..n]);
             self.partial_len += n;
             input = &input[n..];
 
-            if self.partial_len == 16 {
-                let mut block = Zeroizing::new(self.partial);
-                cipher.decrypt_block((&mut *block).into());
-
-                if self.has_held {
-                    output[written..][..16].copy_from_slice(&*self.held);
-                    written += 16;
-                }
-
-                *self.held = *block;
-                self.has_held = true;
-                self.partial_len = 0;
+            if self.partial_len < 16 {
+                return Ok(0);
             }
+            has_partial = true;
         }
+
+        let whole = input.len() / 16 * 16;
+        let blocks = usize::from(has_partial) * 16 + whole;
+        if blocks == 0 {
+            self.partial[..input.len()].copy_from_slice(input);
+            self.partial_len = input.len();
+            return Ok(0);
+        }
+
+        // The held plaintext block goes out first, then every ciphertext block but the last is laid
+        // out after it and decrypted in place in one call, which lets the cipher work on several
+        // blocks at once. The last block is decrypted straight into `held`, since it may be the one
+        // carrying the padding. The cipher carries each block forward as the next one's IV.
+        let mut written = 0;
+        if self.has_held {
+            output[..16].copy_from_slice(&*self.held);
+            written = 16;
+        }
+
+        let (head, last) = if whole == 0 {
+            (&input[..0], &self.partial)
+        } else {
+            (
+                &input[..whole - 16],
+                <&[u8; 16]>::try_from(&input[whole - 16..whole]).unwrap(),
+            )
+        };
+        let batch = blocks - 16;
+        let mut at = written;
+        if has_partial && whole > 0 {
+            output[at..][..16].copy_from_slice(&self.partial);
+            at += 16;
+        }
+        output[at..][..head.len()].copy_from_slice(head);
+
+        let (chunks, _) = Array::slice_as_chunks_mut(&mut output[written..][..batch]);
+        cipher.decrypt_blocks(chunks);
+        written += batch;
+
+        *self.held = *last;
+        cipher.decrypt_block((&mut *self.held).into());
+        self.has_held = true;
+
+        let rest = &input[whole..];
+        self.partial[..rest.len()].copy_from_slice(rest);
+        self.partial_len = rest.len();
 
         Ok(written)
     }
@@ -289,15 +328,35 @@ mod tests {
     #[test]
     fn every_chunk_split_matches_whole_buffer_decryption() {
         for (name, filter, key) in filters() {
-            for len in [0, 1, 15, 16, 17, 31, 32, 33, 100, 1000] {
+            for len in [0, 1, 15, 16, 17, 31, 32, 33, 100, 1000, 4096, 65_541] {
                 let plaintext: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
                 let ciphertext = filter.encrypt(&key, &plaintext).unwrap();
                 let whole = filter.decrypt(&key, &ciphertext).unwrap();
                 assert_eq!(whole, plaintext);
 
-                for chunk in [1, 3, 7, 16, 17, 64, ciphertext.len().max(1)] {
+                for chunk in [1, 3, 7, 15, 16, 17, 31, 33, 64, 4096, 65_536, ciphertext.len().max(1)] {
                     let decrypted = chunked(&*filter, &key, &ciphertext, chunk).unwrap();
                     assert_eq!(decrypted, plaintext, "{name}, {len} bytes in chunks of {chunk}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_plaintext_is_left_in_the_output_past_what_update_wrote() {
+        for (name, filter, key) in filters() {
+            let plaintext: Vec<u8> = (0..1000).map(|i| (i * 7 + 3) as u8).collect();
+            let ciphertext = filter.encrypt(&key, &plaintext).unwrap();
+
+            for chunk in [1, 7, 16, 17, 64, 1000] {
+                let mut decipher = filter.chunked_decrypt(&key).unwrap().unwrap();
+                for piece in ciphertext.chunks(chunk) {
+                    let mut output = vec![0u8; chunk + MAX_EXPANSION];
+                    let n = decipher.update(piece, &mut output).unwrap();
+                    assert!(
+                        output[n..].iter().all(|&b| b == 0),
+                        "{name} in chunks of {chunk}: bytes left past the {n} written"
+                    );
                 }
             }
         }
