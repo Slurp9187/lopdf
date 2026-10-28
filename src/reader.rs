@@ -527,7 +527,7 @@ impl<'a> Reader<'a> {
         reader
     }
 
-    fn with_options(buffer: &'a [u8], options: LoadOptions) -> Self {
+    pub(crate) fn with_options(buffer: &'a [u8], options: LoadOptions) -> Self {
         Self {
             buffer,
             document: Document::new(),
@@ -2076,7 +2076,7 @@ impl<'a> Reader<'a> {
         Self::parse_object_header(input).is_some()
     }
 
-    fn get_xref_start(buffer: &[u8]) -> Result<usize> {
+    pub(crate) fn get_xref_start(buffer: &[u8]) -> Result<usize> {
         // Like other readers, tolerate white-space padding (often NUL bytes) after `%%EOF` and
         // look for the marker within the last 1024 bytes of the rest.
         let end = buffer
@@ -2601,7 +2601,7 @@ fn object_marker_parsing_accepts_only_real_headers() {
 /// cross-reference stream at `/XRefStm` lists. Returns the file and the offset of its
 /// `xref` table.
 #[cfg(all(test, not(feature = "async")))]
-fn hybrid_reference_file() -> (Vec<u8>, usize) {
+pub(crate) fn hybrid_reference_file() -> (Vec<u8>, usize) {
     hybrid_reference_file_with_table("0 2\n0000000000 65535 f \n{o1} 00000 n \n")
 }
 
@@ -2659,7 +2659,7 @@ startxref
 /// Appends an incremental update to `buffer` whose only change is to free object 3, using a
 /// classic `xref` table, and returns the updated file.
 #[cfg(all(test, not(feature = "async")))]
-fn free_object_3_with_table(mut buffer: Vec<u8>, prev: usize) -> Vec<u8> {
+pub(crate) fn free_object_3_with_table(mut buffer: Vec<u8>, prev: usize) -> Vec<u8> {
     let xref_pos = buffer.len();
     buffer.extend_from_slice(
         format!(
@@ -2681,7 +2681,7 @@ startxref
 /// A classic-table file whose object 3 is a dictionary nothing refers to. Returns the file and
 /// the offset of its `xref` table.
 #[cfg(all(test, not(feature = "async")))]
-fn classic_file_with_object_3() -> (Vec<u8>, usize) {
+pub(crate) fn classic_file_with_object_3() -> (Vec<u8>, usize) {
     let header = "%PDF-1.4\n";
     let objects = [
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
@@ -3045,6 +3045,11 @@ impl Reader<'_> {
             (Some(one), Some(left)) => Some(one.min(left)),
             (one, left) => one.or(left),
         }
+    }
+
+    /// How many bytes this reader has decompressed so far, against its total limit.
+    pub(crate) fn decompressed_total(&self) -> usize {
+        self.decompressed_total.load(Ordering::SeqCst)
     }
 
     /// Count `bytes` a stream decompressed to toward the total, and fail the
