@@ -10,6 +10,7 @@ use std::cmp::max;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 /// Which credential a caller-supplied password is checked against.
 #[derive(Clone, Copy)]
@@ -376,7 +377,7 @@ impl Document {
     /// Normalize `password` for this document's revision, then check it.
     fn authenticate_sanitized(&self, password: &str, role: PasswordRole) -> Result<()> {
         let algorithm = self.password_algorithm()?;
-        let password = algorithm.sanitize_password(password)?;
+        let password = Zeroizing::new(algorithm.sanitize_password(password)?);
 
         self.authenticate_with(&algorithm, &password, role)
     }
@@ -454,8 +455,8 @@ impl Document {
         }
 
         let algorithm = PasswordAlgorithm::try_from(&*self)?;
-        let password = algorithm.sanitize_password(password)?;
-        self.decrypt_raw(&password)
+        let password = Zeroizing::new(algorithm.sanitize_password(password)?);
+        self.decrypt_raw(password.as_slice())
     }
 
     /// Same as [`Document::decrypt`], with the password passed as bytes without sanitization.

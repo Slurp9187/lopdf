@@ -5,6 +5,7 @@ use crate::ObjectId;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use md5::{Digest as _, Md5};
 use rand::RngExt as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
@@ -43,8 +44,9 @@ impl CryptFilter for IdentityCryptFilter {
 /// Extend the file key with the low-order 3 bytes of the object number and the
 /// low-order 2 bytes of the generation number, which is how every per-object
 /// key is seeded before hashing (Algorithms 1 and 2.B).
-fn key_with_object_number(key: &[u8], obj_id: ObjectId) -> Vec<u8> {
-    let mut builder = Vec::with_capacity(key.len() + 5);
+fn key_with_object_number(key: &[u8], obj_id: ObjectId) -> Zeroizing<Vec<u8>> {
+    // Room for aes128_compute_key's "sAlT" too, so the key never reallocates.
+    let mut builder = Zeroizing::new(Vec::with_capacity(key.len() + 9));
     builder.extend_from_slice(key);
     builder.extend_from_slice(&obj_id.0.to_le_bytes()[..3]);
     builder.extend_from_slice(&obj_id.1.to_le_bytes()[..2]);
@@ -55,7 +57,11 @@ fn key_with_object_number(key: &[u8], obj_id: ObjectId) -> Vec<u8> {
 /// extended file key, where n is the file key's length.
 fn md5_object_key(extended_key: &[u8], file_key_len: usize) -> Vec<u8> {
     let key_len = (file_key_len + 5).min(16);
-    Md5::digest(extended_key)[..key_len].to_vec()
+    // The digest the key is cut from is key material too, so it is wiped once copied.
+    let mut digest = Md5::digest(extended_key);
+    let key = digest[..key_len].to_vec();
+    digest.as_mut_slice().zeroize();
+    key
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -105,8 +111,9 @@ macro_rules! aes_cbc_crypt_filter {
                 let ciphertext_len = (plaintext.len() + 16) / 16 * 16;
 
                 // Allocate sufficient bytes for the initialization vector, the ciphertext and the padding
-                // combined.
-                let mut ciphertext = Vec::with_capacity(16 + ciphertext_len);
+                // combined. The buffer holds the plaintext until it is encrypted in place, so it is wiped
+                // if encryption fails; the exact capacity means it never reallocates.
+                let mut ciphertext = Zeroizing::new(Vec::with_capacity(16 + ciphertext_len));
 
                 // Generate random numbers to populate the initialization vector.
                 let mut rng = rand::rng();
@@ -123,7 +130,7 @@ macro_rules! aes_cbc_crypt_filter {
                     // Padding errors should not occur when encrypting, but avoid causing a panic.
                     .map_err(|_| DecryptionError::Padding)?;
 
-                Ok(ciphertext)
+                Ok(std::mem::take(&mut *ciphertext))
             }
 
             fn decrypt(&self, key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, DecryptionError> {
@@ -142,12 +149,18 @@ macro_rules! aes_cbc_crypt_filter {
                 let mut iv = [0x00u8; 16];
                 iv.copy_from_slice(&ciphertext[..16]);
 
-                let data = &mut ciphertext[16..].to_vec();
+                // Decrypt in place and hand the buffer over, rather than copying the plaintext out of
+                // a scratch buffer that is then dropped unwiped. On a padding error it holds whatever
+                // the wrong key produced, so it is wiped then too.
+                let mut data = Zeroizing::new(ciphertext[16..].to_vec());
 
-                Ok(<$dec>::new(key.into(), &iv.into())
-                    .decrypt_padded::<Pkcs5>(data)
+                let plaintext_len = <$dec>::new(key.into(), &iv.into())
+                    .decrypt_padded::<Pkcs5>(&mut data)
                     .map_err(|_| DecryptionError::Padding)?
-                    .to_vec())
+                    .len();
+                data.truncate(plaintext_len);
+
+                Ok(std::mem::take(&mut *data))
             }
         }
     };
