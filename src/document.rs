@@ -4,7 +4,7 @@ use crate::encryption::crypt_filters::*;
 use crate::encryption::{self, EncryptionState, PasswordAlgorithm};
 use crate::xobject::PdfImage;
 use crate::xref::{Xref, XrefRecovery, XrefType};
-use crate::{DecompressError, Error, ObjectStream, Result, Stream};
+use crate::{DecompressError, Error, Linearization, ObjectStream, Result, Stream};
 use log::debug;
 use std::cmp::max;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -70,6 +70,31 @@ pub struct Document {
     /// The encryption state stores the parameters that were used to decrypt this document if the
     /// document has been decrypted.
     pub encryption_state: Option<EncryptionState>,
+
+    /// The linearization parameter dictionary that the file opens with, or `None` when the file
+    /// is not linearized. Like `xref_start`, this is only set during reading.
+    pub linearization: Option<Linearization>,
+
+    /// How many cross-reference sections the `startxref` and `/Prev` chain of the file holds,
+    /// not counting the cross-reference streams of hybrid-reference sections, or 0 when the
+    /// table was rebuilt by scanning or the document was not read from a file. Like
+    /// `xref_start`, this is only set during reading.
+    pub xref_section_count: usize,
+}
+
+/// The object IDs that a traversal from the trailer reaches, in the order it first meets them.
+#[derive(Default)]
+pub(crate) struct TraversedReferences {
+    pub(crate) order: Vec<ObjectId>,
+    pub(crate) seen: HashSet<ObjectId>,
+}
+
+impl TraversedReferences {
+    fn insert(&mut self, id: ObjectId) {
+        if self.seen.insert(id) {
+            self.order.push(id);
+        }
+    }
 }
 
 impl Document {
@@ -111,7 +136,20 @@ impl Document {
             xref_start: 0,
             xref_recovery: None,
             encryption_state: None,
+            linearization: None,
+            xref_section_count: 0,
         }
+    }
+
+    /// The number of revisions of the file the document was read from: its original version
+    /// and one for each incremental update.
+    ///
+    /// A linearized file holds two cross-reference sections in one revision, the first-page
+    /// section and the main one. A document whose table was rebuilt by scanning, or that was
+    /// not read from a file, counts as one revision.
+    pub fn revision_count(&self) -> usize {
+        let linearized = usize::from(self.linearization.is_some() && self.xref_section_count >= 2);
+        self.xref_section_count.saturating_sub(linearized).max(1)
     }
 
     const DEREF_LIMIT: usize = 128;
@@ -239,33 +277,38 @@ impl Document {
 
     /// Traverse objects from trailer recursively, return all referenced object IDs.
     pub fn traverse_objects<A: Fn(&mut Object)>(&mut self, action: A) -> Vec<ObjectId> {
-        fn traverse_array<A: Fn(&mut Object)>(array: &mut [Object], action: &A, refs: &mut Vec<ObjectId>) {
+        self.traverse_objects_inner(action).order
+    }
+
+    /// Traverse objects from trailer recursively, collecting each referenced object ID once.
+    /// A set records the IDs already seen, so the traversal takes time linear in the
+    /// number of references.
+    pub(crate) fn traverse_objects_inner<A: Fn(&mut Object)>(&mut self, action: A) -> TraversedReferences {
+        fn traverse_array<A: Fn(&mut Object)>(array: &mut [Object], action: &A, refs: &mut TraversedReferences) {
             for item in array.iter_mut() {
                 traverse_object(item, action, refs);
             }
         }
-        fn traverse_dictionary<A: Fn(&mut Object)>(dict: &mut Dictionary, action: &A, refs: &mut Vec<ObjectId>) {
+        fn traverse_dictionary<A: Fn(&mut Object)>(dict: &mut Dictionary, action: &A, refs: &mut TraversedReferences) {
             for (_, v) in dict.iter_mut() {
                 traverse_object(v, action, refs);
             }
         }
-        fn traverse_object<A: Fn(&mut Object)>(object: &mut Object, action: &A, refs: &mut Vec<ObjectId>) {
+        fn traverse_object<A: Fn(&mut Object)>(object: &mut Object, action: &A, refs: &mut TraversedReferences) {
             action(object);
             match object {
                 Object::Array(array) => traverse_array(array, action, refs),
                 Object::Dictionary(dict) => traverse_dictionary(dict, action, refs),
                 Object::Stream(stream) => traverse_dictionary(&mut stream.dict, action, refs),
-                Object::Reference(id) if !refs.contains(id) => {
-                    refs.push(*id);
-                }
+                Object::Reference(id) => refs.insert(*id),
                 _ => {}
             }
         }
-        let mut refs = vec![];
+        let mut refs = TraversedReferences::default();
         traverse_dictionary(&mut self.trailer, &action, &mut refs);
         let mut index = 0;
-        while index < refs.len() {
-            if let Some(object) = self.objects.get_mut(&refs[index]) {
+        while index < refs.order.len() {
+            if let Some(object) = self.objects.get_mut(&refs.order[index]) {
                 traverse_object(object, &action, &mut refs);
             }
             index += 1;
@@ -425,6 +468,9 @@ impl Document {
     }
 
     /// Replaces all encrypted Strings and Streams with their decrypted contents
+    ///
+    /// An object that cannot be decrypted does not stop the rest of the document from being
+    /// decrypted; the first error is returned once the whole document has been visited.
     pub fn decrypt(&mut self, password: &str) -> Result<()> {
         if !self.is_encrypted() {
             return Err(Error::NotEncrypted);
@@ -435,8 +481,7 @@ impl Document {
         self.decrypt_raw(&password)
     }
 
-    /// Replaces all encrypted Strings and Streams with their decrypted contents with the password
-    /// provided directly as bytes without sanitization
+    /// Same as [`Document::decrypt`], with the password passed as bytes without sanitization.
     pub fn decrypt_raw<P>(&mut self, password: P) -> Result<()>
     where
         P: AsRef<[u8]>,
@@ -451,6 +496,7 @@ impl Document {
         let encryption_obj_id = self.trailer.get(b"Encrypt").and_then(Object::as_reference)?;
 
         let mut state = EncryptionState::decode(&*self, password)?;
+        let mut first_error = None;
 
         for (&id, obj) in self.objects.iter_mut() {
             // The encryption dictionary is not encrypted, leave it alone
@@ -458,7 +504,9 @@ impl Document {
                 continue;
             }
 
-            encryption::decrypt_object(&state, id, obj)?;
+            if let Err(error) = encryption::decrypt_object(&state, id, obj) {
+                first_error.get_or_insert(error);
+            }
         }
 
         // Add the objects from the object streams now that they have been decrypted.
@@ -497,7 +545,7 @@ impl Document {
 
         self.encryption_state = Some(state);
 
-        Ok(())
+        first_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
     /// Return the PDF document catalog, which is the root of the document's object graph.
@@ -568,9 +616,10 @@ impl Document {
     pub fn add_page_contents(&mut self, page_id: ObjectId, content: Vec<u8>) -> Result<()> {
         let page = self.get_dictionary(page_id)?;
         let mut current_content_list: Vec<Object> = match page.get(b"Contents") {
-            Ok(Object::Reference(id)) => {
-                vec![Object::Reference(*id)]
-            }
+            Ok(Object::Reference(id)) => match self.get_object(*id) {
+                Ok(Object::Array(arr)) => arr.clone(),
+                _ => vec![Object::Reference(*id)],
+            },
             Ok(Object::Array(arr)) => arr.clone(),
             _ => vec![],
         };
@@ -851,10 +900,31 @@ impl Document {
         Ok(annotations)
     }
 
+    /// The `/Resources` dictionary of a page tree node or, when it has none, the one it
+    /// inherits from the nearest ancestor that has one (ISO 32000-1, 7.7.3.4).
+    fn inherited_resources<'a>(&'a self, mut node: &'a Dictionary) -> Result<Option<&'a Dictionary>> {
+        let mut seen = HashSet::new();
+        loop {
+            if node.has(b"Resources") {
+                return self.get_dict_in_dict(node, b"Resources").map(Some);
+            }
+            let Ok(parent_id) = node.get(b"Parent").and_then(Object::as_reference) else {
+                return Ok(None);
+            };
+            if !seen.insert(parent_id) {
+                return Err(Error::ReferenceCycle(parent_id));
+            }
+            node = self.get_dictionary(parent_id)?;
+        }
+    }
+
     pub fn get_page_images(&'_ self, page_id: ObjectId) -> Result<Vec<PdfImage<'_>>> {
         let mut images = vec![];
         if let Ok(page) = self.get_dictionary(page_id) {
-            let resources = self.get_dict_in_dict(page, b"Resources")?;
+            let Some(resources) = self.inherited_resources(page)? else {
+                // No resources, so no images.
+                return Ok(Vec::default());
+            };
             let xobject = match self.get_dict_in_dict(resources, b"XObject") {
                 Ok(xobject) => xobject,
                 Err(err) => match err {
