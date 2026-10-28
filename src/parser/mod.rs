@@ -81,7 +81,7 @@ fn white_space(input: ParserInput) -> NomResult<()> {
 }
 
 /// White space and comments, as many as there are.
-fn space(mut input: ParserInput) -> NomResult<()> {
+pub(crate) fn space(mut input: ParserInput) -> NomResult<()> {
     loop {
         let blanks = input.iter().take_while(|&&c| is_whitespace(c)).count();
         if blanks > 0 {
@@ -1289,7 +1289,7 @@ startxref
 %%EOF
 ";
         match xref(test_span(input), false) {
-            Ok((_, re)) => assert_eq!(normal_entries(&re), 15),
+            Ok((_, re)) => assert_eq!(re.entries.values().filter(|e| e.is_normal()).count(), 15),
             Err(err) => panic!("unexpected {:?}", err),
         }
     }
@@ -1508,7 +1508,7 @@ EI";
         // Some PDF generators emit "xref \n" with a trailing space.
         let input = b"xref \n0 3\n0000000000 65535 f \n0000000017 00000 n \n0000000081 00000 n \ntrailer\n<</Size 3/Root 1 0 R>>\nstartxref\n175\n%%EOF\n";
         match xref(test_span(input), false) {
-            Ok((_, re)) => assert_eq!(normal_entries(&re), 2),
+            Ok((_, re)) => assert_eq!(re.entries.values().filter(|e| e.is_normal()).count(), 2),
             Err(err) => panic!("xref with trailing space should parse: {:?}", err),
         }
     }
@@ -1528,7 +1528,7 @@ EI";
             ),
         ] {
             match xref(test_span(input), false) {
-                Ok((_, re)) => assert_eq!(normal_entries(&re), 2, "{name} should yield both normal entries"),
+                Ok((_, re)) => assert_eq!(re.entries.values().filter(|e| e.is_normal()).count(), 2, "{name} should yield both normal entries"),
                 Err(err) => panic!("19-byte entries ({name}) should parse when lenient: {err:?}"),
             }
         }
@@ -1602,7 +1602,7 @@ EI";
         ] {
             for strict in [false, true] {
                 match xref(test_span(input), strict) {
-                    Ok((_, re)) => assert_eq!(normal_entries(&re), 2, "{name} (strict={strict}) lost an entry"),
+                    Ok((_, re)) => assert_eq!(re.entries.values().filter(|e| e.is_normal()).count(), 2, "{name} (strict={strict}) lost an entry"),
                     Err(err) => panic!("conforming {name} entries should parse (strict={strict}): {err:?}"),
                 }
             }
@@ -1635,7 +1635,7 @@ EI";
             match xref(test_span(input), strict) {
                 Ok((_, re)) => {
                     assert_eq!(
-                        normal_entries(&re),
+                        re.entries.values().filter(|e| e.is_normal()).count(),
                         1,
                         "(strict={strict}) unexpected entries: {:?}",
                         re.entries

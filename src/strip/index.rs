@@ -102,7 +102,7 @@ fn read_complete_section<R: Read + Seek>(
             .and_then(|offset| u64::try_from(offset).ok())
             .ok_or(fallback(StripFallback::XrefUnresolvable))?;
         let (stream_xref, _) = read_section(source, base, stream_offset, caps, decoded)?;
-        xref.merge_hybrid_stream(stream_xref);
+        xref.merge_hybrid(stream_xref);
     }
 
     check_count(&xref, caps)?;

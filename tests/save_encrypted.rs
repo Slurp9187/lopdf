@@ -158,6 +158,26 @@ fn an_already_encrypted_document_is_refused() {
     assert!(pdf.is_empty());
 }
 
+/// ASCII output would hex-encode ciphertext that a reader decrypts before applying the filter, as
+/// `save_with_options` already refuses for an encrypted document (upstream #639).
+#[test]
+fn an_ascii_save_is_refused_before_anything_is_written() {
+    for use_object_streams in [false, true] {
+        let mut doc = sample_document();
+        let options = SaveOptions::builder()
+            .use_object_streams(use_object_streams)
+            .ascii(true)
+            .build();
+        let mut pdf = Vec::new();
+        let refused = doc.save_encrypted(&mut pdf, &aes256_state(), options);
+        assert!(
+            matches!(&refused, Err(lopdf::Error::IO(e)) if e.kind() == std::io::ErrorKind::InvalidInput),
+            "object streams {use_object_streams}: {refused:?}"
+        );
+        assert!(pdf.is_empty());
+    }
+}
+
 /// An encrypted save leaves the document as it was, as a plain save does since upstream #633:
 /// the `/Encrypt` dictionary is numbered after `max_id` for the save only, and the object
 /// streams after it, so none of them shares a number.
