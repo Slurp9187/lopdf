@@ -80,7 +80,7 @@ pub enum Object {
     Null,
     Boolean(bool),
     Integer(i64),
-    Real(f32),
+    Real(f64),
     Name(Vec<u8>),
     String(Vec<u8>, StringFormat),
     Array(Vec<Object>),
@@ -147,13 +147,15 @@ impl<'a> From<&'a str> for Object {
 
 impl From<f64> for Object {
     fn from(number: f64) -> Self {
-        Object::Real(number as f32)
+        Object::Real(number)
     }
 }
 
 impl From<f32> for Object {
+    /// Keeps the decimal the `f32` stands for: widened bit for bit, `0.1f32` would be written
+    /// as `0.10000000149011612`.
     fn from(number: f32) -> Self {
-        Object::Real(number)
+        Object::Real(number.to_string().parse().unwrap_or(f64::from(number)))
     }
 }
 
@@ -209,18 +211,24 @@ impl Object {
 
     /// Get the object value as a float.
     /// Unlike [`Object::as_f32`] this will also cast an Integer to a Real.
+    /// [`Object::as_f64`] keeps a real's full precision.
     pub fn as_float(&self) -> Result<f32> {
         match self {
             Object::Integer(value) => Ok(*value as f32),
-            Object::Real(value) => Ok(*value),
+            Object::Real(value) => Ok(*value as f32),
             _ => Err(self.type_error("Integer or Real")),
         }
+    }
+
+    /// A real, rounded to `f32`. [`Object::as_f64`] keeps its full precision.
+    pub fn as_f32(&self) -> Result<f32> {
+        self.as_f64().map(|value| value as f32)
     }
 
     object_copy_getters! {
         as_bool: Boolean => bool = "Boolean", value;
         as_i64: Integer => i64 = "Integer", value;
-        as_f32: Real => f32 = "Real", value;
+        as_f64: Real => f64 = "Real", value;
         as_reference: Reference => ObjectId = "Reference", value;
     }
 
