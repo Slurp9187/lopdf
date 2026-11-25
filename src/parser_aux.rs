@@ -5,7 +5,7 @@ use crate::{
     content::{Content, Operation},
     document::Document,
     encodings::Encoding,
-    error::ParseError,
+    error::{ParseError, XrefError},
     object::Object::Name,
     xref::{Xref, XrefEntry, XrefType},
 };
@@ -573,13 +573,16 @@ pub fn decode_xref_stream(stream: Stream) -> Result<(Xref, Dictionary)> {
 pub fn decode_xref_stream_with_limit(
     stream: Stream, max_decompressed_size: Option<usize>,
 ) -> Result<(Xref, Dictionary)> {
-    decode_xref_stream_counted(stream, max_decompressed_size, |_| Ok(()))
+    decode_xref_stream_counted(stream, max_decompressed_size, None, |_| Ok(()))
 }
 
 /// [`decode_xref_stream_with_limit`], first handing `charge` the size the stream
-/// decompressed to, for a loader that bounds the total across streams.
+/// decompressed to, for a loader that bounds the total across streams. Fails with
+/// [`XrefError::TooManyEntries`] when the stream lists more than `max_entries` entries, before
+/// it holds any of them.
 pub(crate) fn decode_xref_stream_counted(
-    mut stream: Stream, max_decompressed_size: Option<usize>, charge: impl FnOnce(usize) -> Result<()>,
+    mut stream: Stream, max_decompressed_size: Option<usize>, max_entries: Option<usize>,
+    charge: impl FnOnce(usize) -> Result<()>,
 ) -> Result<(Xref, Dictionary)> {
     if stream.is_compressed() {
         match max_decompressed_size {
@@ -640,6 +643,11 @@ pub(crate) fn decode_xref_stream_counted(
         const MIN_ENTRY_WIDTH: usize = 3;
         if index_entries > reader.get_ref().len() / entry_width.max(MIN_ENTRY_WIDTH) {
             return Err(ParseError::InvalidXref.into());
+        }
+        if let Some(limit) = max_entries
+            && index_entries > limit
+        {
+            return Err(Error::Xref(XrefError::TooManyEntries { limit }));
         }
 
         let mut bytes1 = vec![0_u8; field_widths[0] as usize];
@@ -732,6 +740,27 @@ fn parse_integer_array(array: &Object) -> Result<Vec<i64>> {
 
 #[cfg(test)]
 mod tests {
+    /// A cross-reference stream listing more entries than allowed fails before any is kept.
+    #[test]
+    fn a_cross_reference_stream_over_the_entry_limit_fails_before_its_entries_are_kept() {
+        use super::decode_xref_stream_counted;
+        use crate::{Error, Stream, XrefError};
+        let stream = || {
+            let dict = crate::dictionary! {
+                "Type" => "XRef",
+                "Size" => 3,
+                "W" => vec![1.into(), 1.into(), 1.into()],
+            };
+            Stream::new(dict, vec![0, 0, 0, 1, 9, 0, 1, 12, 0])
+        };
+        assert!(matches!(
+            decode_xref_stream_counted(stream(), None, Some(2), |_| Ok(())),
+            Err(Error::Xref(XrefError::TooManyEntries { limit: 2 }))
+        ));
+        let (xref, _) = decode_xref_stream_counted(stream(), None, Some(3), |_| Ok(())).unwrap();
+        assert_eq!(xref.entries.len(), 3);
+    }
+
     #[cfg(not(feature = "async"))]
     #[test]
     fn load_and_save() {

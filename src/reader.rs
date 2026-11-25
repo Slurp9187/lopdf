@@ -1687,8 +1687,10 @@ impl<'a> Reader<'a> {
                 xref.merge_hybrid(stream_xref);
                 Ok(false)
             }
-            // A decompression limit is never skipped, here either.
+            // Resource limits are never skipped, here either: the stream is not ignored as
+            // unreadable.
             Err(e) if is_decompression_limit(&e) => Err(e),
+            Err(e @ Error::Xref(XrefError::TooManyEntries { .. })) => Err(e),
             // The table alone still describes a hybrid-reference file for older readers.
             Err(e) if !self.strict => {
                 warn!("ignoring unreadable cross-reference stream at {start}: {e}");
@@ -2021,9 +2023,10 @@ impl<'a> Reader<'a> {
             }
             // Counted toward the total like the streams resolution decodes.
             let limit = self.stream_limit();
-            let decoded = crate::parser_aux::decode_xref_stream_counted(stream, limit, |decoded| {
-                self.charge_decompressed(decoded)
-            });
+            let decoded =
+                crate::parser_aux::decode_xref_stream_counted(stream, limit, self.max_xref_entries, |decoded| {
+                    self.charge_decompressed(decoded)
+                });
             let (stream_xref, dictionary) = match decoded {
                 Ok(decoded) => decoded,
                 Err(e @ Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {

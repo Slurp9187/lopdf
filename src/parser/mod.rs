@@ -707,9 +707,12 @@ pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(X
                     let res = match obj {
                         Object::Stream(stream) => {
                             let limit = reader.stream_limit();
-                            crate::parser_aux::decode_xref_stream_counted(stream, limit, |decoded| {
-                                reader.charge_decompressed(decoded)
-                            })
+                            crate::parser_aux::decode_xref_stream_counted(
+                                stream,
+                                limit,
+                                reader.max_xref_entries,
+                                |decoded| reader.charge_decompressed(decoded),
+                            )
                             .map_err(|e| reader.total_limit_error(limit, e))
                         }
                         _ => Err(crate::error::ParseError::InvalidXref.into()),
