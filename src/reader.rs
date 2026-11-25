@@ -960,6 +960,12 @@ impl<'a> Reader<'a> {
             // Each raw copy is parsed once, so release it as soon as it has been parsed instead of
             // holding a second copy of every object until loading ends.
             let raw_objects = std::mem::take(&mut self.raw_objects);
+            let mut streams = Vec::new();
+            // Taken from the objects before the load filter sees them, so that a filter cannot
+            // change which crypt filter decrypts a stream.
+            let mut embedded_files = std::collections::HashSet::new();
+            // Dictionaries an indirect `/EF` may refer to, as they were before the load filter.
+            let mut ef_dictionaries = std::collections::HashMap::new();
             for (obj_id, raw_bytes) in raw_objects {
                 if let Some(enc_ref) = encrypt_ref
                     && obj_id == enc_ref
@@ -969,9 +975,21 @@ impl<'a> Reader<'a> {
 
                 if let Ok((id, mut obj)) = self.parse_raw_object(&raw_bytes) {
                     drop(raw_bytes);
+                    // Whether a stream is an embedded file, which /EFF decrypts, is known only once
+                    // every file specification is, object streams included; streams wait for that.
+                    if obj.as_stream().is_ok_and(|stream| !stream.dict.has_type(b"ObjStm")) {
+                        streams.push((obj_id, id, obj));
+                        continue;
+                    }
                     // An object that fails to decrypt fails the load: keeping it would leave
                     // ciphertext in a document that no longer says it is encrypted.
                     encryption::decrypt_object(state, obj_id, &mut obj)?;
+                    embedded_files.extend(encryption::embedded_file_ids([&obj]));
+                    if let Ok(dict) = obj.as_dict()
+                        && encryption::has_ef_dictionary_keys(dict)
+                    {
+                        ef_dictionaries.insert(obj_id, dict.clone());
+                    }
 
                     // Apply the load filter to the decrypted object, as `load_objects_raw` does.
                     if let Some(filter_func) = filter_func
@@ -1002,6 +1020,12 @@ impl<'a> Reader<'a> {
                             for (obj_num, _index) in objects_in_stream {
                                 let obj_id = (obj_num, 0);
                                 if let Some(obj) = object_stream.objects.get(&obj_id) {
+                                    embedded_files.extend(encryption::embedded_file_ids([obj]));
+                                    if let Ok(dict) = obj.as_dict()
+                                        && encryption::has_ef_dictionary_keys(dict)
+                                    {
+                                        ef_dictionaries.insert(obj_id, dict.clone());
+                                    }
                                     let mut obj = obj.clone();
                                     if let Some(filter_func) = filter_func {
                                         // Object-stream members keep what the filter returns, as
@@ -1026,6 +1050,26 @@ impl<'a> Reader<'a> {
                         }
                     }
                 }
+            }
+
+            // A file specification can also sit in a stream's dictionary, as `Document::encrypt`
+            // finds it there.
+            for (_, _, obj) in &streams {
+                embedded_files.extend(encryption::embedded_file_ids([obj]));
+            }
+            encryption::resolve_indirect_ef_dictionaries(&mut embedded_files, |id| ef_dictionaries.get(id));
+            for (obj_id, id, mut obj) in streams {
+                if embedded_files.contains(&obj_id) {
+                    encryption::decrypt_embedded_file(state, obj_id, &mut obj)?;
+                } else {
+                    encryption::decrypt_object(state, obj_id, &mut obj)?;
+                }
+                if let Some(filter_func) = filter_func
+                    && filter_func(id, &mut obj).is_none()
+                {
+                    continue;
+                }
+                self.document.objects.insert(id, obj);
             }
 
             let mut stored_state = state.clone();

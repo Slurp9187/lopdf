@@ -457,8 +457,13 @@ impl Document {
         // document as it was.
         let object_id = self.try_new_object_id()?;
 
+        let embedded_files = encryption::embedded_file_ids_in(&self.objects);
         for (&id, obj) in self.objects.iter_mut() {
-            encryption::encrypt_object(state, id, obj)?;
+            if embedded_files.contains(&id) {
+                encryption::encrypt_embedded_file(state, id, obj)?;
+            } else {
+                encryption::encrypt_object(state, id, obj)?;
+            }
         }
 
         self.objects.insert(object_id, Object::Dictionary(encrypted));
@@ -470,8 +475,9 @@ impl Document {
 
     /// Replaces all encrypted Strings and Streams with their decrypted contents
     ///
-    /// An object that cannot be decrypted does not stop the rest of the document from being
-    /// decrypted; the first error is returned once the whole document has been visited.
+    /// When an object cannot be decrypted, the first error is returned and the document is left
+    /// as it was, still encrypted: a document that kept some objects encrypted without its
+    /// `/Encrypt` would save their ciphertext as if it were plain.
     pub fn decrypt(&mut self, password: &str) -> Result<()> {
         if !self.is_encrypted() {
             return Err(Error::NotEncrypted);
@@ -498,10 +504,19 @@ impl Document {
 
         let mut state = EncryptionState::decode(&*self, password)?;
         let mut first_error = None;
+        // Restored if anything fails to decrypt, so that the document is never half decrypted.
+        let encrypted = self.objects.clone();
 
+        // Whether a stream is an embedded file, which /EFF decrypts, is known only once every file
+        // specification is, object streams included; streams wait for that.
+        let mut streams = vec![];
         for (&id, obj) in self.objects.iter_mut() {
             // The encryption dictionary is not encrypted, leave it alone
             if id == encryption_obj_id {
+                continue;
+            }
+            if obj.as_stream().is_ok_and(|stream| !stream.dict.has_type(b"ObjStm")) {
+                streams.push(id);
                 continue;
             }
 
@@ -536,6 +551,27 @@ impl Document {
             self.objects.entry(id).or_insert(entry);
         }
 
+        let embedded_files = encryption::embedded_file_ids_in(&self.objects);
+        for id in streams {
+            let Some(obj) = self.objects.get_mut(&id) else {
+                continue;
+            };
+            // As for every other object, a stream that fails to decrypt does not stop the rest.
+            let result = if embedded_files.contains(&id) {
+                encryption::decrypt_embedded_file(&state, id, obj)
+            } else {
+                encryption::decrypt_object(&state, id, obj)
+            };
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            self.objects = encrypted;
+            return Err(error.into());
+        }
+        drop(encrypted);
+
         let object_id = self.trailer.remove(b"Encrypt").unwrap().as_reference()?;
         self.objects.remove(&object_id);
 
@@ -546,7 +582,7 @@ impl Document {
 
         self.encryption_state = Some(state);
 
-        first_error.map_or(Ok(()), |error| Err(error.into()))
+        Ok(())
     }
 
     /// Return the PDF document catalog, which is the root of the document's object graph.
