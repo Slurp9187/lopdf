@@ -176,6 +176,31 @@ fn a_stream_that_fails_to_decrypt_does_not_stop_the_rest() {
     }
 }
 
+/// Encrypting again with the state a load recorded keeps `/EFF`, and encrypts with it every
+/// embedded file, the ones known only by `/EF` included, so the file decrypts as it did.
+#[test]
+fn encrypting_again_keeps_the_embedded_file_filter() {
+    let doc = Document::load_mem_with_options(&eff_document(), LoadOptions::with_password(USER)).unwrap();
+    let state = doc.encryption_state.clone().unwrap();
+    let mut doc = doc;
+    doc.encryption_state = None;
+    doc.encrypt(&state).unwrap();
+    let encrypt = doc.trailer.get(b"Encrypt").unwrap().as_reference().unwrap();
+    let eff = doc
+        .get_dictionary(encrypt)
+        .unwrap()
+        .get(b"EFF")
+        .unwrap()
+        .as_name()
+        .unwrap();
+    assert_eq!(eff, b"EmbCF");
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let doc = Document::load_mem_with_options(&bytes, LoadOptions::with_password(USER)).unwrap();
+    assert_decrypted(&doc);
+}
+
 #[test]
 fn the_embedded_file_filter_fixture_decrypts() {
     // The same shape as `eff_document`, committed so that other projects can test against these
