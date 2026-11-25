@@ -4,8 +4,8 @@
 use super::index::{Index, read_index};
 use super::source::Source;
 use super::{
-    Caps, Inspection, PasswordCheck, Signed, StripFallback, StripObserver, StripOptions, StripReport, Unobserved,
-    UsageRights, observe_strings,
+    Caps, Inspection, PasswordCheck, SecurityHandler, Signed, StripFallback, StripObserver, StripOptions, StripReport,
+    Unobserved, UsageRights, observe_strings,
 };
 use crate::encryption::stream::{ChunkDecipher, IdentityDecipher, MAX_EXPANSION};
 use crate::encryption::{self, PasswordAlgorithm};
@@ -73,9 +73,12 @@ pub(crate) fn inspect<R: Read + Seek>(input: R, password: Option<&str>, caps: &C
 
     let mut check = PasswordCheck::NotGiven;
     let mut state = None;
+    let mut security_handler = SecurityHandler::NotEncrypted;
     if encrypted {
+        security_handler = SecurityHandler::Other;
         match stand_in(&mut source, &index, caps) {
             Ok((stand_in, _)) => {
+                security_handler = security_handler_of(&stand_in);
                 if let Err(Error::NeedsWholeDocument(reason)) = check_embedded_file_filter(&stand_in) {
                     needs_whole_document.get_or_insert(reason);
                 }
@@ -112,6 +115,7 @@ pub(crate) fn inspect<R: Read + Seek>(input: R, password: Option<&str>, caps: &C
 
     Ok(Inspection {
         encrypted,
+        security_handler,
         password: check,
         signed,
         usage_rights,
@@ -198,6 +202,21 @@ fn stand_in<R: Read + Seek>(
         _ => return Err(fallback(StripFallback::EncryptUnreadable)),
     };
     Ok((stand_in, encrypt_id))
+}
+
+/// Which security handler `stand_in`'s encryption dictionary names. `Standard` only when the
+/// password check can read it: [`PasswordAlgorithm::try_from`] is the parse
+/// `authenticate_password` runs first, so a failure here is a failure there.
+fn security_handler_of(stand_in: &Document) -> SecurityHandler {
+    let Ok(dict) = stand_in.get_encrypted() else {
+        return SecurityHandler::Other;
+    };
+    match dict.get(b"Filter").and_then(Object::as_name) {
+        Ok(b"Standard") if PasswordAlgorithm::try_from(stand_in).is_ok() => SecurityHandler::Standard,
+        Ok(b"Standard") => SecurityHandler::StandardUnreadable,
+        Ok(b"Adobe.PubSec") => SecurityHandler::PublicKey,
+        _ => SecurityHandler::Other,
+    }
 }
 
 /// The decryption state for `password`, which must authenticate.
