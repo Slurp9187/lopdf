@@ -156,6 +156,26 @@ fn decrypting_a_document_uses_the_embedded_file_filter_too() {
     assert_decrypted(&doc);
 }
 
+/// A stream that fails to decrypt is reported once the rest of the document is decrypted, as
+/// any other object is: the document is never left half decrypted.
+#[test]
+fn a_stream_that_fails_to_decrypt_does_not_stop_the_rest() {
+    let mut doc = encrypted_eff_document();
+    // AES needs whole 16-byte blocks after the IV; five bytes cannot decrypt.
+    doc.get_object_mut(IDS[0])
+        .unwrap()
+        .as_stream_mut()
+        .unwrap()
+        .set_content(b"short".to_vec());
+    assert!(doc.decrypt(USER).is_err());
+    assert!(!doc.is_encrypted());
+    assert!(doc.encryption_state.is_some());
+    for (id, plaintext) in IDS[1..].iter().zip([TYPED, OWN_FILTER, CONTENT]) {
+        let stream = doc.get_object(*id).unwrap().as_stream().unwrap();
+        assert_eq!(stream.content, plaintext, "{id:?}");
+    }
+}
+
 #[test]
 fn the_embedded_file_filter_fixture_decrypts() {
     // The same shape as `eff_document`, committed so that other projects can test against these

@@ -547,10 +547,14 @@ impl Document {
             let Some(obj) = self.objects.get_mut(&id) else {
                 continue;
             };
-            if embedded_files.contains(&id) {
-                encryption::decrypt_embedded_file(&state, id, obj)?;
+            // As for every other object, a stream that fails to decrypt does not stop the rest.
+            let result = if embedded_files.contains(&id) {
+                encryption::decrypt_embedded_file(&state, id, obj)
             } else {
-                encryption::decrypt_object(&state, id, obj)?;
+                encryption::decrypt_object(&state, id, obj)
+            };
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
             }
         }
 
