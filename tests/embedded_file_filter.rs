@@ -226,19 +226,26 @@ fn encrypting_again_keeps_the_embedded_file_filter() {
     assert_decrypted(&doc);
 }
 
-/// `save_encrypted`, with object streams or without, encrypts every embedded file with `/EFF` too.
+/// `save_encrypted`, with object streams or without, encrypts every embedded file with `/EFF` too,
+/// the ones an indirect `/EF` dictionary names included.
 #[test]
 fn saving_encrypted_keeps_the_embedded_file_filter() {
-    let mut doc = Document::load_mem_with_options(&eff_document(), LoadOptions::with_password(USER)).unwrap();
-    let state = doc.encryption_state.take().unwrap();
-    for use_object_streams in [false, true] {
-        let options = lopdf::SaveOptions::builder()
-            .use_object_streams(use_object_streams)
-            .build();
-        let mut bytes = Vec::new();
-        doc.save_encrypted(&mut bytes, &state, options).unwrap();
-        let reloaded = Document::load_mem_with_options(&bytes, LoadOptions::with_password(USER)).unwrap();
-        assert_decrypted(&reloaded);
+    for indirect_ef in [false, true] {
+        let mut encrypted = Vec::new();
+        encrypted_eff_document_with(indirect_ef)
+            .save_to(&mut encrypted)
+            .unwrap();
+        let mut doc = Document::load_mem_with_options(&encrypted, LoadOptions::with_password(USER)).unwrap();
+        let state = doc.encryption_state.take().unwrap();
+        for use_object_streams in [false, true] {
+            let options = lopdf::SaveOptions::builder()
+                .use_object_streams(use_object_streams)
+                .build();
+            let mut bytes = Vec::new();
+            doc.save_encrypted(&mut bytes, &state, options).unwrap();
+            let reloaded = Document::load_mem_with_options(&bytes, LoadOptions::with_password(USER)).unwrap();
+            assert_decrypted(&reloaded);
+        }
     }
 }
 
