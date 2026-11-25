@@ -1,6 +1,6 @@
 use log::{error, warn};
 use std::cmp;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::TryInto;
 #[cfg(not(feature = "async"))]
 use std::fs::File;
@@ -350,8 +350,8 @@ pub struct Reader<'a> {
     pub strict: bool,                             // Reject non-conforming PDFs when true
     /// Maximum decompressed size, in bytes, allowed for any single stream
     /// (object streams and cross-reference streams) decoded during loading.
-    /// `None` (the default) applies no limit; set it to guard against
-    /// decompression bombs. See [`crate::LoadOptions`].
+    /// Defaults to [`crate::DEFAULT_MAX_DECOMPRESSED_SIZE`]; `None` applies no
+    /// limit. See [`crate::LoadOptions`].
     pub max_decompressed_size: Option<usize>,
     /// Rebuild the cross-reference table by scanning before reading it as written. See
     /// [`LoadOptions::force_reconstruct`].
@@ -361,6 +361,10 @@ pub struct Reader<'a> {
     /// object-boundary lookups can binary-search the successor offset instead
     /// of scanning all xref entries on each call.
     normal_offsets: Vec<usize>,
+    /// Objects whose free entry in the final cross-reference table comes from a section whose
+    /// `/XRefStm` could not be read. Such an entry may be a placeholder for an object in an object
+    /// stream, so it does not keep that object out of its object stream.
+    free_without_xref_stream: BTreeSet<u32>,
     /// Object streams decoded while resolving compressed objects, keyed by
     /// container number; `None` records one that failed to decode. Without it
     /// every indirect `/Length` stored in an object stream re-reads and
@@ -371,6 +375,14 @@ pub struct Reader<'a> {
     /// (`Some(true)`) whatever the document's size.
     #[cfg(all(test, feature = "rayon"))]
     parallel: Option<bool>,
+}
+
+/// The objects that `xref` lists as free.
+fn free_ids(xref: &Xref) -> impl Iterator<Item = u32> + '_ {
+    xref.entries
+        .iter()
+        .filter(|(_, entry)| matches!(entry, XrefEntry::Free | XrefEntry::UnusableFree))
+        .map(|(&id, _)| id)
 }
 
 /// With the `rayon` feature, a document with fewer cross-reference entries
@@ -504,7 +516,8 @@ const STANDARD_INFO_KEYS: &[&[u8]] = &[
 ];
 
 impl<'a> Reader<'a> {
-    /// A reader with the default load options: no password, lenient, unlimited.
+    /// A reader with the default load options: no password, lenient, and the
+    /// default decompression bound.
     ///
     /// This deliberately defers to `LoadOptions::default()`, so a field added
     /// there later is picked up here rather than silently reset to a stale
@@ -532,6 +545,7 @@ impl<'a> Reader<'a> {
             max_decompressed_size: options.max_decompressed_size,
             force_reconstruct: options.force_reconstruct,
             normal_offsets: Vec::new(),
+            free_without_xref_stream: BTreeSet::new(),
             object_streams: Mutex::default(),
             #[cfg(all(test, feature = "rayon"))]
             parallel: None,
@@ -877,7 +891,7 @@ impl<'a> Reader<'a> {
         matches!(kids, Some(Object::Array(_)))
     }
 
-    fn load_encrypted_document(&mut self, _filter_func: Option<FilterFunc>) -> Result<()> {
+    fn load_encrypted_document(&mut self, filter_func: Option<FilterFunc>) -> Result<()> {
         // First, extract all raw object bytes without parsing
         let entries: Vec<_> = self
             .document
@@ -920,17 +934,28 @@ impl<'a> Reader<'a> {
                 .ok()
                 .and_then(|o| o.as_reference().ok());
 
-            for (obj_id, raw_bytes) in &self.raw_objects {
+            // Each raw copy is parsed once, so release it as soon as it has been parsed instead of
+            // holding a second copy of every object until loading ends.
+            let raw_objects = std::mem::take(&mut self.raw_objects);
+            for (obj_id, raw_bytes) in raw_objects {
                 if let Some(enc_ref) = encrypt_ref
-                    && *obj_id == enc_ref
+                    && obj_id == enc_ref
                 {
                     continue;
                 }
 
-                if let Ok((id, mut obj)) = self.parse_raw_object(raw_bytes) {
+                if let Ok((id, mut obj)) = self.parse_raw_object(&raw_bytes) {
+                    drop(raw_bytes);
                     // Keep the partial object, but do not drop the error silently.
-                    if let Err(error) = encryption::decrypt_object(state, *obj_id, &mut obj) {
+                    if let Err(error) = encryption::decrypt_object(state, obj_id, &mut obj) {
                         log::warn!("object {obj_id:?} could not be fully decrypted: {error}");
+                    }
+
+                    // Apply the load filter to the decrypted object, as `load_objects_raw` does.
+                    if let Some(filter_func) = filter_func
+                        && filter_func(id, &mut obj).is_none()
+                    {
+                        continue;
                     }
 
                     self.document.objects.insert(id, obj);
@@ -955,7 +980,16 @@ impl<'a> Reader<'a> {
                             for (obj_num, _index) in objects_in_stream {
                                 let obj_id = (obj_num, 0);
                                 if let Some(obj) = object_stream.objects.get(&obj_id) {
-                                    self.document.objects.insert(obj_id, obj.clone());
+                                    let mut obj = obj.clone();
+                                    if let Some(filter_func) = filter_func {
+                                        // Object-stream members keep what the filter returns, as
+                                        // in `load_objects_raw`.
+                                        if let Some((id, obj)) = filter_func(obj_id, &mut obj) {
+                                            self.document.objects.insert(id, obj);
+                                        }
+                                    } else {
+                                        self.document.objects.insert(obj_id, obj);
+                                    }
                                 }
                             }
                         }
@@ -1015,24 +1049,48 @@ impl<'a> Reader<'a> {
         let object_streams = Mutex::new(vec![]);
 
         // Map each compressed object to its xref container, so stale ObjStm copies (e.g. from
-        // linearization first-page sections) cannot override the correct version.
-        let compressed_obj_containers: BTreeMap<u32, u32> = self
+        // linearization first-page sections) cannot override the correct version. A free entry
+        // maps to no container, so an object deleted by a later update is not recovered from an
+        // object stream either, unless the entry comes from a section whose `/XRefStm` could not
+        // be read, where it may be a placeholder for that object.
+        let compressed_obj_containers: BTreeMap<u32, Option<u32>> = self
             .document
             .reference_table
             .entries
             .iter()
-            .filter_map(|(&id, entry)| {
-                if let XrefEntry::Compressed { container, .. } = entry {
-                    Some((id, *container))
-                } else {
-                    None
+            .filter_map(|(&id, entry)| match entry {
+                XrefEntry::Compressed { container, .. } => Some((id, Some(*container))),
+                XrefEntry::Free | XrefEntry::UnusableFree if !self.free_without_xref_stream.contains(&id) => {
+                    Some((id, None))
                 }
+                XrefEntry::Free | XrefEntry::UnusableFree | XrefEntry::Normal { .. } => None,
             })
             .collect();
         let normal_offsets = &self.normal_offsets;
 
-        let entries_filter_map = |(_, entry): (&_, &_)| -> Result<Option<(ObjectId, Object)>> {
+        // A malformed xref can mark many entries in use at one offset: one PDF had 1.9M entries
+        // pointing at the same object stream, and reading it once per entry exhausted memory.
+        // Every read of an offset yields the same object, so an offset is loaded only at its
+        // first entry, which keeps object-stream contents in their original order, and at its
+        // last entry, which alone returns the object so `objects` keeps its original winner.
+        // The entries between would only repeat identical work.
+        let mut offset_entries: HashMap<u32, (u32, u32)> = HashMap::new();
+        for (&id, entry) in &self.document.reference_table.entries {
             if let XrefEntry::Normal { offset, .. } = *entry {
+                offset_entries
+                    .entry(offset)
+                    .and_modify(|(_, last)| *last = id)
+                    .or_insert((id, id));
+            }
+        }
+
+        let entries_filter_map = |(&id, entry): (&u32, &XrefEntry)| -> Result<Option<(ObjectId, Object)>> {
+            if let XrefEntry::Normal { offset, .. } = *entry {
+                let (first_id, last_id) = offset_entries.get(&offset).copied().unwrap_or((id, id));
+                let (is_first, is_last) = (id == first_id, id == last_id);
+                if !is_first && !is_last {
+                    return Ok(None);
+                }
                 // read_object now handles decryption internally
                 let offset = offset as usize;
                 let next_index = normal_offsets.partition_point(|&next| next <= offset);
@@ -1081,7 +1139,7 @@ impl<'a> Reader<'a> {
                                 .filter(|((obj_num, _), _)| {
                                     compressed_obj_containers
                                         .get(obj_num)
-                                        .is_none_or(|&c| c == container_id)
+                                        .is_none_or(|&c| c == Some(container_id))
                                 })
                                 .filter_map(|(object_id, mut object)| filter_func(object_id, &mut object))
                                 .collect();
@@ -1090,7 +1148,7 @@ impl<'a> Reader<'a> {
                             object_streams.extend(obj_stream.objects.into_iter().filter(|((obj_num, _), _)| {
                                 compressed_obj_containers
                                     .get(obj_num)
-                                    .is_none_or(|&c| c == container_id)
+                                    .is_none_or(|&c| c == Some(container_id))
                             }));
                         }
                     } else if stream.content.is_empty() {
@@ -1099,7 +1157,7 @@ impl<'a> Reader<'a> {
                     }
                 }
 
-                Ok(Some((object_id, object)))
+                Ok(is_last.then_some((object_id, object)))
             } else {
                 Ok(None)
             }
@@ -1187,8 +1245,8 @@ impl<'a> Reader<'a> {
                 Ok(length) => Ok(length),
                 // s7.3.8.2 requires an integer /Length, but some producers write a real ("42.");
                 // accept one whose value is integral and in range.
-                Err(err) => match obj.as_f32() {
-                    Ok(value) if value.fract() == 0.0 && value >= -(2f32.powi(63)) && value < 2f32.powi(63) => {
+                Err(err) => match obj.as_f64() {
+                    Ok(value) if value.fract() == 0.0 && value >= -(2f64.powi(63)) && value < 2f64.powi(63) => {
                         Ok(value as i64)
                     }
                     _ => Err(err),
@@ -1465,7 +1523,10 @@ impl<'a> Reader<'a> {
         }
         let (xref_start, mut xref, mut trailer) = self.xref_and_trailer_at(xref_start)?;
         self.document.xref_start = xref_start;
-        self.merge_hybrid_xref_stream(&mut xref, trailer.remove(b"XRefStm"))?;
+        self.free_without_xref_stream.clear();
+        if self.merge_hybrid_xref_stream(&mut xref, trailer.remove(b"XRefStm"))? {
+            self.free_without_xref_stream.extend(free_ids(&xref));
+        }
         let mut sections = 1;
 
         // Read previous Xrefs of linearized or incremental updated document. A `/Prev` that leads
@@ -1484,7 +1545,11 @@ impl<'a> Reader<'a> {
 
             let (_, mut prev_xref, mut prev_trailer) = self.xref_and_trailer_at(prev as usize)?;
             sections += 1;
-            self.merge_hybrid_xref_stream(&mut prev_xref, prev_trailer.remove(b"XRefStm"))?;
+            if self.merge_hybrid_xref_stream(&mut prev_xref, prev_trailer.remove(b"XRefStm"))? {
+                // Only the free entries that stay: a newer section's entry wins the merge below.
+                self.free_without_xref_stream
+                    .extend(free_ids(&prev_xref).filter(|id| !xref.entries.contains_key(id)));
+            }
             xref.merge(prev_xref);
 
             prev_xref_start = prev_trailer.remove(b"Prev");
@@ -1504,20 +1569,26 @@ impl<'a> Reader<'a> {
 
     /// Merge the cross-reference stream that a section of a hybrid-reference file points to
     /// with `/XRefStm`. Its entries come after the section's table and before older sections.
-    fn merge_hybrid_xref_stream(&mut self, xref: &mut Xref, xref_stream_start: Option<Object>) -> Result<()> {
+    /// Returns whether the section names a stream that could not be read and was ignored.
+    fn merge_hybrid_xref_stream(&mut self, xref: &mut Xref, xref_stream_start: Option<Object>) -> Result<bool> {
         let Some(start) = xref_stream_start.and_then(|offset| offset.as_i64().ok()) else {
-            return Ok(());
+            return Ok(false);
         };
         if start < 0 || start as usize > self.buffer.len() {
             return Err(Error::Xref(XrefError::StreamStart));
         }
         match self.xref_and_trailer_at(start as usize) {
-            Ok((_, stream_xref, _)) => xref.merge_hybrid(stream_xref),
+            Ok((_, stream_xref, _)) => {
+                xref.merge_hybrid(stream_xref);
+                Ok(false)
+            }
             // The table alone still describes a hybrid-reference file for older readers.
-            Err(e) if !self.strict => warn!("ignoring unreadable cross-reference stream at {start}: {e}"),
-            Err(e) => return Err(e),
+            Err(e) if !self.strict => {
+                warn!("ignoring unreadable cross-reference stream at {start}: {e}");
+                Ok(true)
+            }
+            Err(e) => Err(e),
         }
-        Ok(())
     }
 
     /// Last-resort recovery: rebuild the cross-reference table by scanning the
@@ -2601,6 +2672,112 @@ startxref
         .as_bytes(),
     );
     (buffer, xref_pos)
+}
+
+#[cfg(all(test, not(feature = "async")))]
+#[test]
+fn free_entry_of_incremental_update_deletes_object_in_object_stream() {
+    // Object 3 is stored in object stream 4.
+    let (mut buffer, prev) = hybrid_reference_file();
+    assert!(Document::load_mem(&buffer).unwrap().get_object((3, 0)).is_ok());
+
+    // The update deletes object 3.
+    let xref_pos = buffer.len();
+    buffer.extend_from_slice(
+        format!(
+            "xref
+0 1
+0000000003 65535 f 
+3 1
+0000000000 00001 f 
+trailer
+<< /Size 6 /Root 1 0 R /Prev {prev} >>
+startxref
+{xref_pos}
+%%EOF
+"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = Document::load_mem(&buffer).unwrap();
+    assert!(loaded.get_object((3, 0)).is_err());
+    assert!(!loaded.objects.contains_key(&(3, 0)));
+    // The rest of the object stream still loads.
+    assert!(loaded.get_object((2, 0)).is_ok());
+}
+
+#[cfg(all(test, not(feature = "async")))]
+#[test]
+fn unreadable_xref_stream_keeps_objects_its_table_lists_as_free() {
+    // A hybrid-reference table lists object 5, which is stored in object stream 4, as free for
+    // readers without cross-reference streams. Its /XRefStm points at the catalog, so it cannot
+    // be read and the free entry is never replaced.
+    let header = "%PDF-1.5\n";
+    let objects = [
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_string(),
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>\nendobj\n".to_string(),
+        {
+            let content = "5 0 << /Marker (keep) >>";
+            format!(
+                "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n{content}\nendstream\nendobj\n",
+                content.len()
+            )
+        },
+    ];
+    let mut buffer = header.to_string();
+    let mut table = String::from("xref\n0 6\n0000000000 65535 f \n");
+    for object in &objects {
+        table.push_str(&format!("{:010} 00000 n \n", buffer.len()));
+        buffer.push_str(object);
+    }
+    table.push_str("0000000000 65535 f \n");
+    let xref_pos = buffer.len();
+    let catalog = header.len();
+    buffer.push_str(&format!(
+        "{table}trailer\n<< /Size 6 /Root 1 0 R /XRefStm {catalog} >>\nstartxref\n{xref_pos}\n%%EOF\n"
+    ));
+
+    let loaded = Document::load_mem(buffer.as_bytes()).unwrap();
+    assert_eq!(loaded.xref_recovery, None);
+    let marker = loaded.get_object((5, 0)).and_then(Object::as_dict).unwrap();
+    assert_eq!(marker.get(b"Marker").and_then(Object::as_str).ok(), Some(&b"keep"[..]));
+}
+
+#[cfg(all(test, not(feature = "async")))]
+#[test]
+fn unreadable_xref_stream_keeps_a_deletion_of_its_section() {
+    // Object 4 is an ordinary object in the first revision.
+    let header = "%PDF-1.5\n";
+    let objects = [
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>\nendobj\n",
+        "4 0 obj\n<< /Marker (old) >>\nendobj\n",
+    ];
+    let mut buffer = header.to_string();
+    let mut table = String::from("xref\n0 5\n0000000000 65535 f \n");
+    for object in objects {
+        table.push_str(&format!("{:010} 00000 n \n", buffer.len()));
+        buffer.push_str(object);
+    }
+    let prev = buffer.len();
+    buffer.push_str(&format!(
+        "{table}trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{prev}\n%%EOF\n"
+    ));
+
+    // The update deletes object 4, and its /XRefStm points at the catalog, so it cannot be read.
+    let catalog = header.len();
+    let xref_pos = buffer.len();
+    buffer.push_str(&format!(
+        "xref\n0 1\n0000000004 65535 f \n4 1\n0000000000 00001 f \ntrailer\n<< /Size 5 /Root 1 0 R /Prev {prev} /XRefStm {catalog} >>\nstartxref\n{xref_pos}\n%%EOF\n"
+    ));
+
+    let loaded = Document::load_mem(buffer.as_bytes()).unwrap();
+    assert_eq!(loaded.xref_recovery, None);
+    assert!(loaded.get_object((4, 0)).is_err());
+    assert!(matches!(loaded.reference_table.get(4), Some(XrefEntry::Free)));
 }
 
 #[cfg(all(test, not(feature = "async")))]
