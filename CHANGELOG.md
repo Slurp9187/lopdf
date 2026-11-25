@@ -2,7 +2,7 @@
 <a name="unreleased"></a>
 ## [Unreleased](https://github.com/J-F-Liu/lopdf/compare/v0.45.0...HEAD)
 * Wipe the file encryption key when an `EncryptionState` (or a clone of it) is dropped
-* Redact the key, the passwords and the password-derived `/O`, `/U`, `/OE`, `/UE` and `/Perms` values from the `Debug` output of `EncryptionState` and `EncryptionVersion`, and so from a decrypted `Document`'s
+* Print `***` for the password-derived `/O`, `/U`, `/OE`, `/UE` and `/Perms` values in the `Debug` output of `EncryptionState`, and so of a decrypted `Document`, as upstream already does for the key and the passwords
 * Wipe the password a loader was given, and the sanitized and recovered passwords and intermediate keys derived from it, once they are no longer needed
 * Enable the `zeroize` features of `aes`, `cbc`, `ecb`, `md-5` and `sha2`, which wipe cipher key schedules and hash state
 
