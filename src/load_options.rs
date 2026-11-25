@@ -59,6 +59,14 @@ pub struct LoadOptions {
     /// Defaults to [`DEFAULT_MAX_DECOMPRESSED_SIZE`]. `None` applies no limit; use it
     /// only for PDFs from a trusted source.
     pub max_decompressed_size: Option<usize>,
+    /// Maximum number of bytes all the streams decoded during loading may
+    /// decompress to together (object streams and cross-reference streams).
+    ///
+    /// [`Self::max_decompressed_size`] bounds one stream; a file can hold many,
+    /// each just under it. Set this to bound the total; going past it fails the
+    /// load with [`crate::DecompressError::MemoryLimitExceeded`] naming this
+    /// limit. `None` (the default) applies no total.
+    pub max_total_decompressed_size: Option<usize>,
     /// When `true`, rebuild the cross-reference table by scanning the file for indirect
     /// objects instead of reading it as written, as lenient loading does when the
     /// cross-reference data cannot be read. Use it for a file whose cross-reference data
@@ -77,6 +85,7 @@ impl Default for LoadOptions {
             filter: None,
             strict: false,
             max_decompressed_size: Some(DEFAULT_MAX_DECOMPRESSED_SIZE),
+            max_total_decompressed_size: None,
             force_reconstruct: false,
         }
     }
@@ -89,6 +98,7 @@ impl std::fmt::Debug for LoadOptions {
             .field("filter", &self.filter.map(|_| "fn(..)"))
             .field("strict", &self.strict)
             .field("max_decompressed_size", &self.max_decompressed_size)
+            .field("max_total_decompressed_size", &self.max_total_decompressed_size)
             .field("force_reconstruct", &self.force_reconstruct)
             .finish()
     }
