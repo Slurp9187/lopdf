@@ -105,5 +105,9 @@ harness = false
 name = "parse"
 harness = false
 
+[[bench]]
+name = "decrypt_stream"
+harness = false
+
 [badges]
 travis-ci = { repository = "J-F-Liu/lopdf" }

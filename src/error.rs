@@ -7,6 +7,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    /// The streaming Strip cannot handle this file in bounded memory, for the reason given; strip it
+    /// through the whole-document path instead. Fork-only.
+    #[error("the file needs the whole-document path: {0}")]
+    NeedsWholeDocument(crate::strip::StripFallback),
+
     /// Lopdf does not (yet) implement a needed feature.
     #[error(
         "missing feature of lopdf: {0}; please open an issue at https://github.com/J-F-Liu/lopdf/ to let the developers know of your usecase"
