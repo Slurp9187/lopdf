@@ -362,6 +362,8 @@ pub struct Reader<'a> {
     /// Rebuild the cross-reference table by scanning before reading it as written. See
     /// [`LoadOptions::force_reconstruct`].
     pub force_reconstruct: bool,
+    /// Most cross-reference entries kept. See [`LoadOptions::max_xref_entries`].
+    pub max_xref_entries: Option<usize>,
     /// Sorted unique byte offsets of every `XrefEntry::Normal` entry in the
     /// final cross-reference table. Built once when the table is complete so
     /// object-boundary lookups can binary-search the successor offset instead
@@ -552,6 +554,7 @@ impl<'a> Reader<'a> {
             max_total_decompressed_size: options.max_total_decompressed_size,
             decompressed_total: AtomicUsize::new(0),
             force_reconstruct: options.force_reconstruct,
+            max_xref_entries: options.max_xref_entries,
             normal_offsets: Vec::new(),
             free_without_xref_stream: BTreeSet::new(),
             object_streams: Mutex::default(),
@@ -824,6 +827,7 @@ impl<'a> Reader<'a> {
                     .max_total_decompressed_size
                     .map(|total| total.saturating_sub(self.decompressed_total.load(Ordering::SeqCst))),
                 force_reconstruct: true,
+                max_xref_entries: self.max_xref_entries,
                 ..LoadOptions::default()
             };
             match Reader::with_options(self.buffer, options).read(None) {
@@ -857,6 +861,8 @@ impl<'a> Reader<'a> {
             Ok(resolved) => Ok(resolved),
             // The scan already found nothing usable.
             Err(err) if self.force_reconstruct => Err(err),
+            // A resource limit, not damage: rebuilding by scanning would not honour it.
+            Err(err @ Error::Xref(XrefError::TooManyEntries { .. })) => Err(err),
             Err(err) => match self.reconstruct_xref_and_trailer() {
                 Some(reconstructed) => {
                     warn!("cross-reference resolution failed ({err}); recovered by scanning for indirect objects");
@@ -919,10 +925,16 @@ impl<'a> Reader<'a> {
             .collect();
 
         let mut object_streams = Vec::new();
+        // Entries sharing an offset read the same object, whose own header names it, so read each
+        // offset once; a table can list millions of entries at one offset.
+        let mut read_offsets = HashSet::new();
 
         for (obj_num, entry) in entries {
             match entry {
                 XrefEntry::Normal { offset, .. } => {
+                    if !read_offsets.insert(offset) {
+                        continue;
+                    }
                     if let Ok((obj_id, raw_bytes)) = self.extract_raw_object(offset as usize) {
                         self.raw_objects.insert(obj_id, raw_bytes);
                     }
@@ -1579,6 +1591,7 @@ impl<'a> Reader<'a> {
         if self.merge_hybrid_xref_stream(&mut xref, trailer.remove(b"XRefStm"))? {
             self.free_without_xref_stream.extend(free_ids(&xref));
         }
+        self.check_xref_entries(&xref)?;
         let mut sections = 1;
 
         // Read previous Xrefs of linearized or incremental updated document. A `/Prev` that leads
@@ -1596,6 +1609,7 @@ impl<'a> Reader<'a> {
             }
 
             let (_, mut prev_xref, mut prev_trailer) = self.xref_and_trailer_at(prev as usize)?;
+            self.check_xref_entries(&prev_xref)?;
             sections += 1;
             if self.merge_hybrid_xref_stream(&mut prev_xref, prev_trailer.remove(b"XRefStm"))? {
                 // Only the free entries that stay: a newer section's entry wins the merge below.
@@ -1603,6 +1617,7 @@ impl<'a> Reader<'a> {
                     .extend(free_ids(&prev_xref).filter(|id| !xref.entries.contains_key(id)));
             }
             xref.merge(prev_xref);
+            self.check_xref_entries(&xref)?;
 
             prev_xref_start = prev_trailer.remove(b"Prev");
         }
@@ -1617,6 +1632,14 @@ impl<'a> Reader<'a> {
         self.document.xref_section_count = sections;
 
         Ok((xref, trailer))
+    }
+
+    /// Fails when `xref` holds more entries than [`LoadOptions::max_xref_entries`].
+    fn check_xref_entries(&self, xref: &Xref) -> Result<()> {
+        match self.max_xref_entries {
+            Some(limit) if xref.entries.len() > limit => Err(Error::Xref(XrefError::TooManyEntries { limit })),
+            _ => Ok(()),
+        }
     }
 
     /// Merge the cross-reference stream that a section of a hybrid-reference file points to
@@ -2240,6 +2263,51 @@ async fn load_document() {
     let temp_dir = tempfile::tempdir().unwrap();
     let file_path = temp_dir.path().join("test_2_load.pdf");
     doc.save(file_path).unwrap();
+}
+
+/// A table whose entries all point at one object: `rows` entries, objects 1 to
+/// `rows`, each at the catalog's offset.
+#[cfg(test)]
+fn shared_offset_document(rows: usize) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let catalog = out.len();
+    out.extend(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages = out.len();
+    out.extend(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    let xref = out.len();
+    out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", rows + 3).bytes());
+    out.extend(format!("{catalog:010} 00000 n \n{pages:010} 00000 n \n").bytes());
+    for _ in 0..rows {
+        out.extend(format!("{catalog:010} 00000 n \n").bytes());
+    }
+    out.extend(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            rows + 3
+        )
+        .bytes(),
+    );
+    out
+}
+
+#[test]
+fn a_table_over_the_entry_limit_is_refused_and_not_rebuilt() {
+    let bytes = shared_offset_document(1000);
+    let options = |max_xref_entries| LoadOptions {
+        max_xref_entries,
+        ..Default::default()
+    };
+    let refused = Document::load_mem_with_options(&bytes, options(Some(500)));
+    assert!(
+        matches!(refused, Err(Error::Xref(XrefError::TooManyEntries { limit: 500 }))),
+        "{refused:?}"
+    );
+    // Under the limit, and with none, the file loads; entries sharing an offset
+    // read the same object, so only the catalog and the page tree load.
+    for max in [Some(5000), None] {
+        let doc = Document::load_mem_with_options(&bytes, options(max)).unwrap();
+        assert_eq!(doc.objects.len(), 2, "{max:?}");
+    }
 }
 
 #[test]
