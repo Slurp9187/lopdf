@@ -61,19 +61,29 @@ impl Destination {
 type OutlinePageIds = Vec<(Vec<u8>, ObjectId, usize)>;
 
 fn setup_outline_page_ids<'a>(
-    outlines: &'a Vec<Outline>, result: &mut OutlinePageIds, level: usize,
+    outlines: &'a Vec<Outline>, result: &mut OutlinePageIds, errors: &mut Vec<String>, level: usize,
 ) -> Result<&'a Vec<Outline>> {
     for outline in outlines.iter() {
         match outline {
             Outline::Destination(destination) => {
-                result.push((
-                    destination.title()?.as_str()?.to_vec(),
-                    destination.page()?.as_reference()?,
-                    level,
-                ));
+                let Ok(title) = destination.title()?.as_str() else {
+                    let title = destination.title()?;
+                    errors.push(format!("Outline item title {title:?} isn't a string, skipped"));
+                    continue;
+                };
+                // A GoToR action points to a page of another file by its number, which has
+                // no page in this document, so the item is skipped with a warning.
+                let Ok(page_id) = destination.page()?.as_reference() else {
+                    let title = decode_text_string(destination.title()?).unwrap_or_default();
+                    errors.push(format!(
+                        "Outline item {title:?} doesn't point to a page of this document, skipped"
+                    ));
+                    continue;
+                };
+                result.push((title.to_vec(), page_id, level));
             }
             Outline::SubOutlines(sub_outlines) => {
-                setup_outline_page_ids(sub_outlines, result, level + 1)?;
+                setup_outline_page_ids(sub_outlines, result, errors, level + 1)?;
             }
         }
     }
@@ -101,7 +111,7 @@ impl Document {
         };
 
         let mut outline_page_ids = Vec::new();
-        setup_outline_page_ids(&outlines, &mut outline_page_ids, 1)?;
+        setup_outline_page_ids(&outlines, &mut outline_page_ids, &mut toc.errors, 1)?;
         let page_id_to_page_numbers = self.setup_page_id_to_num();
         for (title, page_id, level) in outline_page_ids {
             if let Some(page_num) = page_id_to_page_numbers.get(&page_id) {
@@ -150,6 +160,11 @@ impl Document {
                     title: s,
                     page: *page_num as usize,
                 });
+            } else {
+                let title = decode_text_string(&Object::string_literal(title)).unwrap_or_default();
+                toc.errors.push(format!(
+                    "Outline item {title:?} doesn't point to a page of this document, skipped"
+                ));
             }
         }
         Ok(toc)
@@ -335,5 +350,303 @@ mod tests {
         let toc = doc.get_toc().unwrap();
         let actual: Vec<_> = toc.toc.iter().map(|entry| entry.title.as_str()).collect();
         assert_eq!(actual, ["Good", "Explicit"]);
+    }
+
+    #[test]
+    fn follow_referenced_name_tree_arrays() {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! { "Type" => "Page", "Parent" => pages_id });
+        let pages = dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+
+        // /Kids, /Names and /D written as indirect objects instead of direct arrays.
+        let d = doc.add_object(vec![page_id.into(), "Fit".into()]);
+        let names = doc.add_object(vec![
+            Object::string_literal("intro"),
+            vec![page_id.into(), "Fit".into()].into(),
+            Object::string_literal("outro"),
+            dictionary! { "D" => d }.into(),
+        ]);
+        let leaf = doc.add_object(dictionary! {
+            "Limits" => vec![Object::string_literal("intro"), Object::string_literal("outro")],
+            "Names" => names,
+        });
+        let kids = doc.add_object(vec![leaf.into()]);
+
+        let outlines_id = doc.new_object_id();
+        let outro = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("Outro"),
+            "Parent" => outlines_id,
+            "Dest" => Object::string_literal("outro"),
+        });
+        let intro = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("Intro"),
+            "Parent" => outlines_id,
+            "Dest" => Object::string_literal("intro"),
+            "Next" => outro,
+        });
+        let outlines = dictionary! { "Type" => "Outlines", "First" => intro };
+        doc.objects.insert(outlines_id, Object::Dictionary(outlines));
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+            "Outlines" => outlines_id,
+            "Names" => dictionary! { "Dests" => dictionary! { "Kids" => kids } },
+        });
+        doc.trailer.set("Root", catalog_id);
+
+        let toc = doc.get_toc().unwrap();
+        let actual: Vec<_> = toc.toc.iter().map(|entry| (entry.title.as_str(), entry.page)).collect();
+        assert_eq!(actual, [("Intro", 1), ("Outro", 1)]);
+    }
+
+    #[test]
+    fn resolve_referenced_titles_with_dest() {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! { "Type" => "Page", "Parent" => pages_id });
+        let pages = dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+
+        // /Title written as an indirect object on items that use /Dest instead of /A.
+        let explicit_title = doc.add_object(Object::string_literal("Explicit"));
+        let named_title = doc.add_object(Object::string_literal("Named"));
+
+        let outlines_id = doc.new_object_id();
+        let named = doc.add_object(dictionary! {
+            "Title" => named_title,
+            "Parent" => outlines_id,
+            "Dest" => Object::string_literal("intro"),
+        });
+        let explicit = doc.add_object(dictionary! {
+            "Title" => explicit_title,
+            "Parent" => outlines_id,
+            "Dest" => vec![page_id.into(), "Fit".into()],
+            "Next" => named,
+        });
+        let outlines = dictionary! { "Type" => "Outlines", "First" => explicit };
+        doc.objects.insert(outlines_id, Object::Dictionary(outlines));
+        let dests = dictionary! {
+            "Names" => vec![Object::string_literal("intro"), vec![page_id.into(), "Fit".into()].into()],
+        };
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+            "Outlines" => outlines_id,
+            "Names" => dictionary! { "Dests" => dests },
+        });
+        doc.trailer.set("Root", catalog_id);
+
+        let toc = doc.get_toc().unwrap();
+        let actual: Vec<_> = toc.toc.iter().map(|entry| (entry.title.as_str(), entry.page)).collect();
+        assert_eq!(actual, [("Explicit", 1), ("Named", 1)]);
+    }
+
+    #[test]
+    fn resolve_names_from_dests_dictionary() {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page1 = doc.add_object(dictionary! { "Type" => "Page", "Parent" => pages_id });
+        let page2 = doc.add_object(dictionary! { "Type" => "Page", "Parent" => pages_id });
+        let pages = dictionary! { "Type" => "Pages", "Kids" => vec![page1.into(), page2.into()], "Count" => 2 };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+
+        // A PDF 1.1 /Dests dictionary in the catalog, keyed by names, next to a /Dests name tree.
+        let outro = doc.add_object(dictionary! { "D" => vec![page2.into(), "Fit".into()] });
+        let dests = doc.add_object(dictionary! {
+            "intro" => vec![page1.into(), "Fit".into()],
+            "outro" => outro,
+        });
+        let name_tree = dictionary! {
+            "Names" => vec![Object::string_literal("summary"), vec![page2.into(), "Fit".into()].into()],
+        };
+
+        let outlines_id = doc.new_object_id();
+        let summary = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("Summary"),
+            "Parent" => outlines_id,
+            "Dest" => Object::string_literal("summary"),
+        });
+        let outro = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("Outro"),
+            "Parent" => outlines_id,
+            "A" => dictionary! { "S" => "GoTo", "D" => "outro" },
+            "Next" => summary,
+        });
+        let intro = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("Intro"),
+            "Parent" => outlines_id,
+            "Dest" => "intro",
+            "Next" => outro,
+        });
+        let outlines = dictionary! { "Type" => "Outlines", "First" => intro };
+        doc.objects.insert(outlines_id, Object::Dictionary(outlines));
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+            "Outlines" => outlines_id,
+            "Dests" => dests,
+            "Names" => dictionary! { "Dests" => name_tree },
+        });
+        doc.trailer.set("Root", catalog_id);
+
+        let toc = doc.get_toc().unwrap();
+        let actual: Vec<_> = toc.toc.iter().map(|entry| (entry.title.as_str(), entry.page)).collect();
+        assert_eq!(actual, [("Intro", 1), ("Outro", 2), ("Summary", 2)]);
+        assert!(toc.errors.is_empty());
+    }
+
+    #[test]
+    fn skip_destinations_without_page_reference() {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! { "Type" => "Page", "Parent" => pages_id });
+        let pages = dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+
+        // A GoToR action gives the page in the other file as a page number, not a reference.
+        let outlines_id = doc.new_object_id();
+        let after = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("After"),
+            "Parent" => outlines_id,
+            "Dest" => vec![page_id.into(), "Fit".into()],
+        });
+        let remote = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("Remote"),
+            "Parent" => outlines_id,
+            "A" => dictionary! {
+                "S" => "GoToR",
+                "F" => Object::string_literal("other.pdf"),
+                "D" => vec![0.into(), "Fit".into()],
+            },
+            "Next" => after,
+        });
+        let before = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("Before"),
+            "Parent" => outlines_id,
+            "Dest" => vec![page_id.into(), "Fit".into()],
+            "Next" => remote,
+        });
+        let outlines = dictionary! { "Type" => "Outlines", "First" => before };
+        doc.objects.insert(outlines_id, Object::Dictionary(outlines));
+        let catalog_id =
+            doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id, "Outlines" => outlines_id });
+        doc.trailer.set("Root", catalog_id);
+
+        let toc = doc.get_toc().unwrap();
+        let actual: Vec<_> = toc.toc.iter().map(|entry| (entry.title.as_str(), entry.page)).collect();
+        assert_eq!(actual, [("Before", 1), ("After", 1)]);
+        assert_eq!(
+            toc.errors,
+            ["Outline item \"Remote\" doesn't point to a page of this document, skipped"]
+        );
+    }
+
+    #[test]
+    fn skip_titles_that_are_not_strings() {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! { "Type" => "Page", "Parent" => pages_id });
+        let pages = dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+
+        // A /Title written as a name, and one that refers to a number.
+        let number_title = doc.add_object(42);
+
+        let outlines_id = doc.new_object_id();
+        let after = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("After"),
+            "Parent" => outlines_id,
+            "Dest" => vec![page_id.into(), "Fit".into()],
+        });
+        let number = doc.add_object(dictionary! {
+            "Title" => number_title,
+            "Parent" => outlines_id,
+            "A" => dictionary! { "S" => "GoTo", "D" => vec![page_id.into(), "Fit".into()] },
+            "Next" => after,
+        });
+        let name = doc.add_object(dictionary! {
+            "Title" => "Chapter",
+            "Parent" => outlines_id,
+            "Dest" => vec![page_id.into(), "Fit".into()],
+            "Next" => number,
+        });
+        let before = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("Before"),
+            "Parent" => outlines_id,
+            "Dest" => vec![page_id.into(), "Fit".into()],
+            "Next" => name,
+        });
+        let outlines = dictionary! { "Type" => "Outlines", "First" => before };
+        doc.objects.insert(outlines_id, Object::Dictionary(outlines));
+        let catalog_id =
+            doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id, "Outlines" => outlines_id });
+        doc.trailer.set("Root", catalog_id);
+
+        let toc = doc.get_toc().unwrap();
+        let actual: Vec<_> = toc.toc.iter().map(|entry| (entry.title.as_str(), entry.page)).collect();
+        assert_eq!(actual, [("Before", 1), ("After", 1)]);
+        assert_eq!(
+            toc.errors,
+            [
+                "Outline item title /Chapter isn't a string, skipped",
+                "Outline item title 42 isn't a string, skipped",
+            ]
+        );
+    }
+
+    #[test]
+    fn report_destinations_to_missing_pages() {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! { "Type" => "Page", "Parent" => pages_id });
+        let pages = dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+
+        // A page that was removed from the page tree, and a reference to an object that isn't there.
+        let removed_page = doc.add_object(dictionary! { "Type" => "Page", "Parent" => pages_id });
+        let missing = doc.new_object_id();
+
+        let outlines_id = doc.new_object_id();
+        let after = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("After"),
+            "Parent" => outlines_id,
+            "Dest" => vec![page_id.into(), "Fit".into()],
+        });
+        let dangling = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("Dangling"),
+            "Parent" => outlines_id,
+            "A" => dictionary! { "S" => "GoTo", "D" => vec![missing.into(), "Fit".into()] },
+            "Next" => after,
+        });
+        let removed = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("Removed"),
+            "Parent" => outlines_id,
+            "Dest" => vec![removed_page.into(), "Fit".into()],
+            "Next" => dangling,
+        });
+        let before = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("Before"),
+            "Parent" => outlines_id,
+            "Dest" => vec![page_id.into(), "Fit".into()],
+            "Next" => removed,
+        });
+        let outlines = dictionary! { "Type" => "Outlines", "First" => before };
+        doc.objects.insert(outlines_id, Object::Dictionary(outlines));
+        let catalog_id =
+            doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id, "Outlines" => outlines_id });
+        doc.trailer.set("Root", catalog_id);
+
+        let toc = doc.get_toc().unwrap();
+        let actual: Vec<_> = toc.toc.iter().map(|entry| (entry.title.as_str(), entry.page)).collect();
+        assert_eq!(actual, [("Before", 1), ("After", 1)]);
+        assert_eq!(
+            toc.errors,
+            [
+                "Outline item \"Removed\" doesn't point to a page of this document, skipped",
+                "Outline item \"Dangling\" doesn't point to a page of this document, skipped",
+            ]
+        );
     }
 }
