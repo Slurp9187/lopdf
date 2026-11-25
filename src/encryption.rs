@@ -220,6 +220,9 @@ pub struct EncryptionState {
     pub(crate) file_encryption_key: Zeroizing<Vec<u8>>,
     pub(crate) stream_filter: Vec<u8>,
     pub(crate) string_filter: Vec<u8>,
+    /// `/EFF`, the crypt filter for embedded file streams; empty when absent, and then
+    /// they use `/StmF` like any other stream.
+    pub(crate) embedded_file_filter: Vec<u8>,
     pub(crate) owner_value: Vec<u8>,
     pub(crate) owner_encrypted: Vec<u8>,
     pub(crate) user_value: Vec<u8>,
@@ -339,6 +342,7 @@ impl fmt::Debug for EncryptionState {
             file_encryption_key: _,
             stream_filter,
             string_filter,
+            embedded_file_filter,
             owner_value: _,
             owner_encrypted: _,
             user_value: _,
@@ -356,6 +360,7 @@ impl fmt::Debug for EncryptionState {
             .field("file_encryption_key", &"***")
             .field("stream_filter", stream_filter)
             .field("string_filter", string_filter)
+            .field("embedded_file_filter", embedded_file_filter)
             .field("owner_value", &"***")
             .field("owner_encrypted", &"***")
             .field("user_value", &"***")
@@ -654,6 +659,7 @@ fn aes256_state(revision: i64, params: Aes256Params<'_>) -> Result<EncryptionSta
         file_encryption_key: Zeroizing::new(file_encryption_key.to_vec()),
         stream_filter,
         string_filter,
+        embedded_file_filter: Vec::new(),
         owner_value: algorithm.owner_value,
         owner_encrypted: algorithm.owner_encrypted,
         user_value: algorithm.user_value,
@@ -800,6 +806,14 @@ impl EncryptionState {
             {
                 state.string_filter = string_filter.to_vec();
             }
+
+            if let Ok(embedded_file_filter) = document
+                .get_encrypted()
+                .and_then(|dict| dict.get(b"EFF"))
+                .and_then(|object| object.as_name())
+            {
+                state.embedded_file_filter = embedded_file_filter.to_vec();
+            }
         }
 
         state.check_crypt_filters()?;
@@ -869,6 +883,15 @@ impl EncryptionState {
         self.crypt_filter(&self.stream_filter)
     }
 
+    /// The crypt filter for embedded file streams: `/EFF`, or `/StmF` when there is none
+    /// (ISO 32000-1, 7.6.5).
+    pub fn get_embedded_file_filter(&self) -> Result<Arc<dyn CryptFilter>, DecryptionError> {
+        if self.embedded_file_filter.is_empty() {
+            return self.get_stream_filter();
+        }
+        self.crypt_filter(&self.embedded_file_filter)
+    }
+
     /// The crypt filter that `/StrF` selects for strings.
     pub fn get_string_filter(&self) -> Result<Arc<dyn CryptFilter>, DecryptionError> {
         self.crypt_filter(&self.string_filter)
@@ -893,11 +916,12 @@ impl EncryptionState {
             .ok_or(DecryptionError::UnknownCryptFilter)
     }
 
-    /// Fails if `/StmF` or `/StrF` names a crypt filter that does not exist,
+    /// Fails if `/StmF`, `/StrF` or `/EFF` names a crypt filter that does not exist,
     /// rather than leaving the mistake to surface as wrong bytes later.
     fn check_crypt_filters(&self) -> Result<(), DecryptionError> {
         self.get_stream_filter()?;
         self.get_string_filter()?;
+        self.get_embedded_file_filter()?;
         Ok(())
     }
 }
@@ -929,6 +953,14 @@ fn stream_crypt_filter_name(stream: &Stream) -> Option<&[u8]> {
 enum Direction {
     Encrypt,
     Decrypt,
+    /// Decrypting an object the caller knows is an embedded file stream.
+    DecryptEmbeddedFile,
+}
+
+impl Direction {
+    fn embedded_file(self) -> bool {
+        matches!(self, Direction::DecryptEmbeddedFile)
+    }
 }
 
 /// Applies the document's crypt filter to every string and stream in `obj`,
@@ -961,8 +993,13 @@ fn transform_object(
         // The dictionary's strings use the string filter, its content the stream filter (#603).
         Object::Stream(stream) => {
             let dict_result = transform_dictionary(state, obj_id, &mut stream.dict, direction);
+            // An embedded file stream uses /EFF. A file specification's /EF names it; the caller
+            // knows that, and /Type /EmbeddedFile, which is optional, says so too.
             let filter = match override_crypt_filter {
                 Some(filter) => filter,
+                None if direction.embedded_file() || stream.dict.has_type(b"EmbeddedFile") => {
+                    state.get_embedded_file_filter()?
+                }
                 None => state.get_stream_filter()?,
             };
             let content = transform_bytes(state, obj_id, &*filter, &stream.content, direction);
@@ -1027,7 +1064,7 @@ fn transform_bytes(
 
     match direction {
         Direction::Encrypt => filter.encrypt(&key, data),
-        Direction::Decrypt => filter.decrypt(&key, data),
+        Direction::Decrypt | Direction::DecryptEmbeddedFile => filter.decrypt(&key, data),
     }
 }
 
@@ -1050,6 +1087,43 @@ pub fn encrypt_object(state: &EncryptionState, obj_id: ObjectId, obj: &mut Objec
 /// error is returned.
 pub fn decrypt_object(state: &EncryptionState, obj_id: ObjectId, obj: &mut Object) -> Result<(), DecryptionError> {
     transform_object(state, obj_id, obj, Direction::Decrypt)
+}
+
+/// Decrypts `obj`, an embedded file stream that a file specification's `/EF` names, with `/EFF`.
+/// [`decrypt_object`] recognizes an embedded file only by its optional `/Type /EmbeddedFile`.
+pub fn decrypt_embedded_file(
+    state: &EncryptionState, obj_id: ObjectId, obj: &mut Object,
+) -> Result<(), DecryptionError> {
+    transform_object(state, obj_id, obj, Direction::DecryptEmbeddedFile)
+}
+
+/// The embedded file streams that file specifications among `objects` name in their `/EF`, which
+/// must be decrypted with `/EFF`. References are never encrypted, so this works on encrypted
+/// objects too.
+pub(crate) fn embedded_file_ids<'a>(
+    objects: impl IntoIterator<Item = &'a Object>,
+) -> std::collections::HashSet<ObjectId> {
+    fn walk_dict(dict: &Dictionary, found: &mut std::collections::HashSet<ObjectId>) {
+        if let Ok(Object::Dictionary(files)) = dict.get(b"EF") {
+            found.extend(files.iter().filter_map(|(_, file)| file.as_reference().ok()));
+        }
+        dict.iter().for_each(|(_, value)| walk(value, found));
+    }
+
+    fn walk(object: &Object, found: &mut std::collections::HashSet<ObjectId>) {
+        match object {
+            Object::Array(items) => items.iter().for_each(|item| walk(item, found)),
+            Object::Dictionary(dict) => walk_dict(dict, found),
+            Object::Stream(stream) => walk_dict(&stream.dict, found),
+            _ => {}
+        }
+    }
+
+    let mut found = std::collections::HashSet::new();
+    for object in objects {
+        walk(object, &mut found);
+    }
+    found
 }
 
 #[cfg(test)]
