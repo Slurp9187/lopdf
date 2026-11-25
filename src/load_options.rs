@@ -80,7 +80,8 @@ pub struct LoadOptions {
     /// `/Prev` chain and any `/XRefStm`). A small file can list millions of
     /// entries, since a compressed cross-reference row is a few bytes, and every
     /// entry is kept in memory. A file over it fails with
-    /// [`crate::XrefError::TooManyEntries`] and is not rebuilt by scanning.
+    /// [`crate::XrefError::TooManyEntries`] and is not rebuilt by scanning; a table rebuilt
+    /// by scanning, after damage or with [`Self::force_reconstruct`], is held to it too.
     ///
     /// Defaults to `None`, no limit.
     pub max_xref_entries: Option<usize>,

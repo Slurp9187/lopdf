@@ -156,6 +156,111 @@ fn decrypting_a_document_uses_the_embedded_file_filter_too() {
     assert_decrypted(&doc);
 }
 
+/// A stream that fails to decrypt is reported once the rest of the document is decrypted, as
+/// any other object is: the document is never left half decrypted.
+#[test]
+fn a_stream_that_fails_to_decrypt_does_not_stop_the_rest() {
+    let mut doc = encrypted_eff_document();
+    // AES needs whole 16-byte blocks after the IV; five bytes cannot decrypt.
+    doc.get_object_mut(IDS[0])
+        .unwrap()
+        .as_stream_mut()
+        .unwrap()
+        .set_content(b"short".to_vec());
+    assert!(doc.decrypt(USER).is_err());
+    assert!(!doc.is_encrypted());
+    assert!(doc.encryption_state.is_some());
+    for (id, plaintext) in IDS[1..].iter().zip([TYPED, OWN_FILTER, CONTENT]) {
+        let stream = doc.get_object(*id).unwrap().as_stream().unwrap();
+        assert_eq!(stream.content, plaintext, "{id:?}");
+    }
+}
+
+/// Encrypting again with the state a load recorded keeps `/EFF`, and encrypts with it every
+/// embedded file, the ones known only by `/EF` included, so the file decrypts as it did.
+#[test]
+fn encrypting_again_keeps_the_embedded_file_filter() {
+    let doc = Document::load_mem_with_options(&eff_document(), LoadOptions::with_password(USER)).unwrap();
+    let state = doc.encryption_state.clone().unwrap();
+    let mut doc = doc;
+    doc.encryption_state = None;
+    doc.encrypt(&state).unwrap();
+    let encrypt = doc.trailer.get(b"Encrypt").unwrap().as_reference().unwrap();
+    let eff = doc
+        .get_dictionary(encrypt)
+        .unwrap()
+        .get(b"EFF")
+        .unwrap()
+        .as_name()
+        .unwrap();
+    assert_eq!(eff, b"EmbCF");
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let doc = Document::load_mem_with_options(&bytes, LoadOptions::with_password(USER)).unwrap();
+    assert_decrypted(&doc);
+}
+
+/// `save_encrypted`, with object streams or without, encrypts every embedded file with `/EFF` too.
+#[test]
+fn saving_encrypted_keeps_the_embedded_file_filter() {
+    let mut doc = Document::load_mem_with_options(&eff_document(), LoadOptions::with_password(USER)).unwrap();
+    let state = doc.encryption_state.take().unwrap();
+    for use_object_streams in [false, true] {
+        let options = lopdf::SaveOptions::builder()
+            .use_object_streams(use_object_streams)
+            .build();
+        let mut bytes = Vec::new();
+        doc.save_encrypted(&mut bytes, &state, options).unwrap();
+        let reloaded = Document::load_mem_with_options(&bytes, LoadOptions::with_password(USER)).unwrap();
+        assert_decrypted(&reloaded);
+    }
+}
+
+/// An `/EF` that names no object of the document cannot change how `save_encrypted` encrypts the
+/// object streams it generates, whose numbers come after the document's.
+#[test]
+fn a_dangling_embedded_file_reference_leaves_object_streams_alone() {
+    let mut doc = Document::load_mem_with_options(&eff_document(), LoadOptions::with_password(USER)).unwrap();
+    let state = doc.encryption_state.take().unwrap();
+    let spec = doc.add_object(dictionary! { "Type" => "Filespec", "F" => Object::string_literal("missing.txt") });
+    // /Encrypt takes the number after max_id, and the generated object streams the ones after it.
+    let generated = |offset: u32| Object::Reference((doc.max_id + offset, 0));
+    let ef = dictionary! { "F" => generated(2), "UF" => generated(3) };
+    doc.get_dictionary_mut(spec).unwrap().set("EF", ef);
+    let options = lopdf::SaveOptions::builder().use_object_streams(true).build();
+    let mut bytes = Vec::new();
+    doc.save_encrypted(&mut bytes, &state, options).unwrap();
+    let reloaded = Document::load_mem_with_options(&bytes, LoadOptions::with_password(USER)).unwrap();
+    assert!(reloaded.catalog().is_ok());
+    assert_decrypted(&reloaded);
+}
+
+/// A file specification in a stream's dictionary names an embedded file too, both when the file
+/// is encrypted and when it is loaded again.
+#[test]
+fn a_file_specification_in_a_stream_dictionary_names_an_embedded_file() {
+    const HIDDEN: &[u8] = b"an attachment named from a stream's dictionary";
+    let mut doc = Document::load_mem_with_options(&eff_document(), LoadOptions::with_password(USER)).unwrap();
+    let state = doc.encryption_state.take().unwrap();
+    let hidden = doc.add_object(Stream::new(dictionary! {}, HIDDEN.to_vec()));
+    doc.add_object(Stream::new(
+        dictionary! {
+            "F" => dictionary! {
+                "Type" => "Filespec",
+                "F" => Object::string_literal("hidden.txt"),
+                "EF" => dictionary! { "F" => hidden },
+            },
+        },
+        b"data".to_vec(),
+    ));
+    let mut bytes = Vec::new();
+    doc.encrypt(&state).unwrap();
+    doc.save_to(&mut bytes).unwrap();
+    let doc = Document::load_mem_with_options(&bytes, LoadOptions::with_password(USER)).unwrap();
+    assert_eq!(doc.get_object(hidden).unwrap().as_stream().unwrap().content, HIDDEN);
+}
+
 #[test]
 fn the_embedded_file_filter_fixture_decrypts() {
     // The same shape as `eff_document`, committed so that other projects can test against these

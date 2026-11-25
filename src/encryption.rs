@@ -868,6 +868,10 @@ impl EncryptionState {
             encrypted.set(b"CF", Object::Dictionary(filters));
             encrypted.set(b"StmF", Object::Name(self.stream_filter.clone()));
             encrypted.set(b"StrF", Object::Name(self.string_filter.clone()));
+            // Written back, so the embedded files encrypted with it decrypt with it too.
+            if !self.embedded_file_filter.is_empty() {
+                encrypted.set(b"EFF", Object::Name(self.embedded_file_filter.clone()));
+            }
         }
 
         if self.revision >= 5 {
@@ -983,13 +987,15 @@ pub(crate) fn stream_decipher(
 enum Direction {
     Encrypt,
     Decrypt,
+    /// Encrypting an object the caller knows is an embedded file stream.
+    EncryptEmbeddedFile,
     /// Decrypting an object the caller knows is an embedded file stream.
     DecryptEmbeddedFile,
 }
 
 impl Direction {
     fn embedded_file(self) -> bool {
-        matches!(self, Direction::DecryptEmbeddedFile)
+        matches!(self, Direction::EncryptEmbeddedFile | Direction::DecryptEmbeddedFile)
     }
 }
 
@@ -1093,7 +1099,7 @@ fn transform_bytes(
     let key = Zeroizing::new(filter.compute_key(&state.file_encryption_key, obj_id)?);
 
     match direction {
-        Direction::Encrypt => filter.encrypt(&key, data),
+        Direction::Encrypt | Direction::EncryptEmbeddedFile => filter.encrypt(&key, data),
         Direction::Decrypt | Direction::DecryptEmbeddedFile => filter.decrypt(&key, data),
     }
 }
@@ -1117,6 +1123,15 @@ pub fn encrypt_object(state: &EncryptionState, obj_id: ObjectId, obj: &mut Objec
 /// error is returned.
 pub fn decrypt_object(state: &EncryptionState, obj_id: ObjectId, obj: &mut Object) -> Result<(), DecryptionError> {
     transform_object(state, obj_id, obj, Direction::Decrypt)
+}
+
+/// [`encrypt_object`] for an object the caller knows is an embedded file stream, which a file
+/// specification's `/EF` names: it is encrypted with `/EFF` whether or not it says
+/// `/Type /EmbeddedFile`.
+pub fn encrypt_embedded_file(
+    state: &EncryptionState, obj_id: ObjectId, obj: &mut Object,
+) -> Result<(), DecryptionError> {
+    transform_object(state, obj_id, obj, Direction::EncryptEmbeddedFile)
 }
 
 /// Decrypts `obj`, an embedded file stream that a file specification's `/EF` names, with `/EFF`.

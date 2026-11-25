@@ -449,6 +449,42 @@ fn an_object_stream_listed_twice_counts_toward_the_total_once() {
     assert!(doc.objects.contains_key(&(2, 0)));
 }
 
+/// A file written with a cross-reference stream and no object streams, whose `startxref` points
+/// at nothing, so a load finds the stream by scanning.
+fn xref_stream_pdf_needing_a_scan() -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages = doc.add_object(dictionary! { "Type" => "Pages", "Kids" => vec![], "Count" => 0 });
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference(pages) });
+    doc.trailer.set("Root", Object::Reference(catalog));
+    let options = lopdf::SaveOptions::builder()
+        .use_xref_streams(true)
+        .use_object_streams(false)
+        .build();
+    let mut pdf = Vec::new();
+    doc.save_with_options(&mut pdf, options).unwrap();
+    assert!(!pdf.windows(7).any(|window| window == b"trailer"));
+    let startxref = pdf.windows(9).rposition(|window| window == b"startxref").unwrap();
+    pdf.truncate(startxref);
+    pdf.extend_from_slice(b"startxref\n9\n%%EOF\n");
+    pdf
+}
+
+/// The cross-reference stream that a rebuilt table is found in counts toward the total.
+#[test]
+fn a_scanned_cross_reference_stream_counts_toward_the_total() {
+    let pdf = xref_stream_pdf_needing_a_scan();
+    let doc = Document::load_mem(&pdf).unwrap();
+    assert!(doc.xref_recovery.is_some());
+    let options = LoadOptions {
+        max_total_decompressed_size: Some(1),
+        ..LoadOptions::default()
+    };
+    match Document::load_mem_with_options(&pdf, options) {
+        Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => assert_eq!(limit, 1),
+        other => panic!("expected MemoryLimitExceeded, got {other:?}"),
+    }
+}
+
 /// A file whose objects all sit after an inserted line: its table reads, nothing it points
 /// at loads, and lenient loading rebuilds the table by scanning (upstream #636). The rebuilt
 /// load decodes an object stream the first load never reached.
