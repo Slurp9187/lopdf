@@ -7,6 +7,7 @@ use std::fs::File;
 #[cfg(not(feature = "async"))]
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroize;
 
@@ -26,7 +27,7 @@ use crate::linearization::Linearization;
 use crate::load_options::{FilterFunc, LoadOptions};
 use crate::object_stream::ObjectStream;
 use crate::parser;
-use crate::xref::{Xref, XrefEntry, XrefRecovery, XrefType, decode_xref_stream_with_limit};
+use crate::xref::{Xref, XrefEntry, XrefRecovery, XrefType};
 use crate::{Dictionary, Document, Error, IncrementalDocument, Object, ObjectId, Result};
 
 /// Open `path` and report its size, so the caller can pre-size the buffer it
@@ -353,6 +354,11 @@ pub struct Reader<'a> {
     /// Defaults to [`crate::DEFAULT_MAX_DECOMPRESSED_SIZE`]; `None` applies no
     /// limit. See [`crate::LoadOptions`].
     pub max_decompressed_size: Option<usize>,
+    /// Maximum decompressed size, in bytes, of all the streams decoded during
+    /// loading together. See [`crate::LoadOptions::max_total_decompressed_size`].
+    pub max_total_decompressed_size: Option<usize>,
+    /// What the streams decoded so far came to. Atomic: objects load in parallel.
+    decompressed_total: AtomicUsize,
     /// Rebuild the cross-reference table by scanning before reading it as written. See
     /// [`LoadOptions::force_reconstruct`].
     pub force_reconstruct: bool,
@@ -543,6 +549,8 @@ impl<'a> Reader<'a> {
             password: options.password,
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
+            max_total_decompressed_size: options.max_total_decompressed_size,
+            decompressed_total: AtomicUsize::new(0),
             force_reconstruct: options.force_reconstruct,
             normal_offsets: Vec::new(),
             free_without_xref_stream: BTreeSet::new(),
@@ -808,18 +816,27 @@ impl<'a> Reader<'a> {
             && self.should_rebuild(self.document.xref_recovery)
             && !Self::page_tree_loaded(&self.document)
         {
+            // The rebuilt load decodes streams again, so it gets what is left of the total.
             let options = LoadOptions {
                 password: self.password.clone(),
                 max_decompressed_size: self.max_decompressed_size,
+                max_total_decompressed_size: self
+                    .max_total_decompressed_size
+                    .map(|total| total.saturating_sub(self.decompressed_total.load(Ordering::SeqCst))),
                 force_reconstruct: true,
                 ..LoadOptions::default()
             };
-            if let Ok(rebuilt) = Reader::with_options(self.buffer, options).read(None)
-                && rebuilt.xref_recovery == Some(XrefRecovery::Reconstructed)
-                && Self::page_tree_loaded(&rebuilt)
-            {
-                warn!("{UNREADABLE_PAGE_TREE}");
-                return Ok(rebuilt);
+            match Reader::with_options(self.buffer, options).read(None) {
+                Ok(rebuilt)
+                    if rebuilt.xref_recovery == Some(XrefRecovery::Reconstructed)
+                        && Self::page_tree_loaded(&rebuilt) =>
+                {
+                    warn!("{UNREADABLE_PAGE_TREE}");
+                    return Ok(rebuilt);
+                }
+                // A decompression limit is never skipped, here either.
+                Err(e) if is_decompression_limit(&e) => return Err(e),
+                _ => {}
             }
         }
 
@@ -831,7 +848,7 @@ impl<'a> Reader<'a> {
     /// resolve only if the scan finds no usable trailer.
     fn load_xref_and_trailer(&mut self) -> Result<(Xref, Dictionary)> {
         if self.force_reconstruct
-            && let Some(reconstructed) = self.reconstruct_xref_and_trailer()
+            && let Some(reconstructed) = self.reconstruct_xref_and_trailer()?
         {
             warn!("rebuilt the cross-reference table by scanning for indirect objects, as requested");
             return Ok(reconstructed);
@@ -840,7 +857,7 @@ impl<'a> Reader<'a> {
             Ok(resolved) => Ok(resolved),
             // The scan already found nothing usable.
             Err(err) if self.force_reconstruct => Err(err),
-            Err(err) => match self.reconstruct_xref_and_trailer() {
+            Err(err) => match self.reconstruct_xref_and_trailer()? {
                 Some(reconstructed) => {
                     warn!("cross-reference resolution failed ({err}); recovered by scanning for indirect objects");
                     Ok(reconstructed)
@@ -975,7 +992,7 @@ impl<'a> Reader<'a> {
                 if let Some(container_obj) = self.document.objects.get(&(container_id, 0))
                     && let Ok(stream) = container_obj.as_stream()
                 {
-                    match ObjectStream::new_with_limit(stream, self.max_decompressed_size) {
+                    match self.decode_object_stream(stream) {
                         Ok(object_stream) => {
                             for (obj_num, _index) in objects_in_stream {
                                 let obj_id = (obj_num, 0);
@@ -1106,9 +1123,14 @@ impl<'a> Reader<'a> {
                             warn!("Skipping encrypted object at offset {}: {:?}", offset, e);
                             return Ok(None);
                         }
-                        // Lenient loading logs and skips malformed objects; strict loading fails.
+                        // Lenient loading logs and skips malformed objects; strict loading
+                        // fails. A decompression limit is never skipped.
                         error!("Object load error at offset {}: {e:?}", offset);
-                        return if self.strict { Err(e) } else { Ok(None) };
+                        return if self.strict || is_decompression_limit(&e) {
+                            Err(e)
+                        } else {
+                            Ok(None)
+                        };
                     }
                 };
                 if let Some(filter_func) = filter_func
@@ -1118,8 +1140,13 @@ impl<'a> Reader<'a> {
                 }
 
                 if let Ok(stream) = object.as_stream() {
+                    // Unpacked at the offset's first entry only: a second decode would count the
+                    // stream toward the total twice, and its members are kept from the first.
                     if stream.dict.has_type(b"ObjStm") && !is_encrypted {
-                        let obj_stream = match ObjectStream::new_with_limit(stream, self.max_decompressed_size) {
+                        if !is_first {
+                            return Ok(is_last.then_some((object_id, object)));
+                        }
+                        let obj_stream = match self.decode_object_stream(stream) {
                             Ok(obj_stream) => obj_stream,
                             // Resource limits apply even when malformed objects may be skipped.
                             Err(e @ Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => return Err(e),
@@ -1305,7 +1332,7 @@ impl<'a> Reader<'a> {
         }
         let decoded = self
             .get_object((container, 0), already_seen)
-            .and_then(|object| ObjectStream::new_with_limit(object.as_stream()?, self.max_decompressed_size))
+            .and_then(|object| self.decode_object_stream(object.as_stream()?))
             .map(Arc::new);
         if !matches!(decoded, Err(Error::ReferenceCycle(_))) {
             self.object_streams
@@ -1594,16 +1621,16 @@ impl<'a> Reader<'a> {
     /// Last-resort recovery: rebuild the cross-reference table by scanning the
     /// raw bytes for indirect-object headers and locating a trailer with a
     /// usable `/Root`. Returns `None` (caller keeps the original error) when
-    /// strict mode forbids recovery or nothing usable was found.
-    fn reconstruct_xref_and_trailer(&mut self) -> Option<(Xref, Dictionary)> {
-        if self.strict {
-            return None;
+    /// strict mode forbids recovery or nothing usable was found, and the
+    /// decompression limit a cross-reference stream it found ran into.
+    fn reconstruct_xref_and_trailer(&mut self) -> Result<Option<(Xref, Dictionary)>> {
+        if self.strict || u32::try_from(self.buffer.len()).is_err() {
+            return Ok(None);
         }
-        u32::try_from(self.buffer.len()).ok()?;
 
         let markers = Self::scan_object_markers(self.buffer);
         if markers.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let mut xref = Xref::new(markers.len() as u32, XrefType::CrossReferenceTable);
@@ -1620,13 +1647,17 @@ impl<'a> Reader<'a> {
             // Files written with cross-reference streams only have no `trailer` keyword, and a
             // file cut off before its last cross-reference section may have neither.
             None => {
-                let mut over_limit = false;
-                match self.find_latest_xref_stream(&markers, &mut xref, &mut over_limit) {
-                    Some(trailer) => trailer,
+                let mut over_limit = None;
+                let found = self.find_latest_xref_stream(&markers, &mut xref, &mut over_limit);
+                match (found, over_limit) {
+                    (Some(trailer), _) => trailer,
                     // A cross-reference stream that the decompression limit kept from decoding
                     // is there; the load fails with the limit rather than go on without it.
-                    None if over_limit => return None,
-                    None => self.find_latest_catalog(&markers, &xref)?,
+                    (None, Some(limit)) => return Err(limit),
+                    (None, None) => match self.find_latest_catalog(&markers, &xref) {
+                        Some(trailer) => trailer,
+                        None => return Ok(None),
+                    },
                 }
             }
         };
@@ -1643,7 +1674,7 @@ impl<'a> Reader<'a> {
             "reconstructed cross-reference table with {} objects by scanning for indirect objects",
             xref.entries.len()
         );
-        Some((xref, trailer))
+        Ok(Some((xref, trailer)))
     }
 
     /// Collect `(offset, id)` of every indirect-object header in one pass.
@@ -1869,9 +1900,10 @@ impl<'a> Reader<'a> {
     /// find, so the compressed entries of these streams are added for object
     /// numbers the scan did not see, newer streams first, as resolution merges
     /// `/Prev` sections.
-    /// `over_limit` is set when a stream does not decode within the decompression limit.
+    /// `over_limit` holds the limit error when a stream does not decode within the decompression
+    /// limit, or within what is left of the total.
     fn find_latest_xref_stream(
-        &self, markers: &[(u32, ObjectId)], xref: &mut Xref, over_limit: &mut bool,
+        &self, markers: &[(u32, ObjectId)], xref: &mut Xref, over_limit: &mut Option<Error>,
     ) -> Option<Dictionary> {
         let mut dictionaries = Vec::new();
         let mut compressed = BTreeMap::new();
@@ -1906,10 +1938,15 @@ impl<'a> Reader<'a> {
             if !stream.dict.has_type(b"XRef") {
                 continue;
             }
-            let (stream_xref, dictionary) = match decode_xref_stream_with_limit(stream, self.max_decompressed_size) {
+            // Counted toward the total like the streams resolution decodes.
+            let limit = self.stream_limit();
+            let decoded = crate::parser_aux::decode_xref_stream_counted(stream, limit, |decoded| {
+                self.charge_decompressed(decoded)
+            });
+            let (stream_xref, dictionary) = match decoded {
                 Ok(decoded) => decoded,
-                Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
-                    *over_limit = true;
+                Err(e @ Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+                    over_limit.get_or_insert(self.total_limit_error(limit, e));
                     continue;
                 }
                 Err(_) => continue,
@@ -3042,5 +3079,64 @@ fn sequential_and_parallel_loads_treat_a_malformed_object_alike() {
         assert!(!sequential.objects.contains_key(&page));
         assert_eq!(sequential.objects.len(), intact.objects.len() - 1);
         assert_same_document(&sequential, &parallel);
+    }
+}
+
+/// Whether `e` is a decompression limit the caller set
+/// (`LoadOptions::max_decompressed_size`). Such an error always fails a load,
+/// lenient or strict: it is the caller's bound on an untrusted file, not a
+/// malformed object to skip.
+fn is_decompression_limit(e: &Error) -> bool {
+    matches!(e, Error::Decompress(crate::DecompressError::MemoryLimitExceeded { .. }))
+}
+
+impl Reader<'_> {
+    /// The limit the next stream may decompress to: the per-stream one, or what
+    /// is left of the total, whichever is smaller.
+    pub(crate) fn stream_limit(&self) -> Option<usize> {
+        let left = self
+            .max_total_decompressed_size
+            .map(|total| total.saturating_sub(self.decompressed_total.load(Ordering::SeqCst)));
+        match (self.max_decompressed_size, left) {
+            (Some(one), Some(left)) => Some(one.min(left)),
+            (one, left) => one.or(left),
+        }
+    }
+
+    /// Count `bytes` a stream decompressed to toward the total, and fail the
+    /// load once the total is past its limit.
+    pub(crate) fn charge_decompressed(&self, bytes: usize) -> Result<()> {
+        let Some(total) = self.max_total_decompressed_size else {
+            return Ok(());
+        };
+        let before = self.decompressed_total.fetch_add(bytes, Ordering::SeqCst);
+        if before.saturating_add(bytes) > total {
+            return Err(crate::DecompressError::MemoryLimitExceeded { limit: total }.into());
+        }
+        Ok(())
+    }
+
+    /// A decode that failed under `limit`, a [`Self::stream_limit`], names the
+    /// caller's total when what was left of the total is what it ran into, not
+    /// the leftover (which can be 0).
+    pub(crate) fn total_limit_error(&self, limit: Option<usize>, e: Error) -> Error {
+        match (self.max_total_decompressed_size, &e) {
+            (Some(total), Error::Decompress(crate::DecompressError::MemoryLimitExceeded { .. }))
+                if limit != self.max_decompressed_size =>
+            {
+                crate::DecompressError::MemoryLimitExceeded { limit: total }.into()
+            }
+            _ => e,
+        }
+    }
+
+    /// Decode an object stream under [`Self::stream_limit`], counting it toward
+    /// the total.
+    fn decode_object_stream(&self, stream: &crate::Stream) -> Result<ObjectStream> {
+        let limit = self.stream_limit();
+        let (object_stream, decoded) =
+            ObjectStream::decode_with_limit(stream, limit).map_err(|e| self.total_limit_error(limit, e))?;
+        self.charge_decompressed(decoded)?;
+        Ok(object_stream)
     }
 }

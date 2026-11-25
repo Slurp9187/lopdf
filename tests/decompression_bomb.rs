@@ -10,7 +10,7 @@ use std::io::Write;
 
 use lopdf::{
     DEFAULT_MAX_DECOMPRESSED_SIZE, DecompressError, Dictionary, Document, Error, LoadOptions, Object, ObjectId,
-    ObjectStream, Stream,
+    ObjectStream, Stream, dictionary,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -343,5 +343,211 @@ fn object_stream_bomb_is_rejected_with_limit() {
         }
         Err(other) => panic!("expected MemoryLimitExceeded, got {other:?}"),
         Ok(_) => panic!("object stream bomb was not caught"),
+    }
+}
+
+/// A lenient load never skips an object stream the decompression limit stops: it
+/// fails, so a capped stream's objects cannot vanish from a document the caller
+/// then trusts. Measured before the fix: the load succeeded without them.
+fn pdf_with_object_streams() -> Vec<u8> {
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => Object::Reference(pages_id),
+    });
+    for i in 0..200 {
+        doc.add_object(dictionary! { "Note" => Object::Integer(i) });
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(pages_id),
+    });
+    doc.trailer.set("Root", Object::Reference(catalog));
+    let mut pdf = Vec::new();
+    doc.save_modern(&mut pdf).expect("save with object streams");
+    pdf
+}
+
+#[test]
+fn lenient_load_fails_on_a_capped_object_stream() {
+    let pdf = pdf_with_object_streams();
+    assert!(Document::load_mem_with_options(&pdf, LoadOptions::default()).is_ok());
+    match Document::load_mem_with_options(&pdf, LoadOptions::with_max_decompressed_size(256)) {
+        Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => assert_eq!(limit, 256),
+        Err(other) => panic!("expected MemoryLimitExceeded, got {other:?}"),
+        Ok(_) => panic!("the capped object stream was skipped, not refused"),
+    }
+}
+
+/// The total across every stream a load decodes is bounded on its own: each
+/// stream here is under the per-stream limit, and together they are over the
+/// total.
+#[test]
+fn total_decompressed_size_is_bounded_across_streams() {
+    let pdf = pdf_with_object_streams();
+    let mut options = LoadOptions::with_max_decompressed_size(MIB);
+    assert!(Document::load_mem_with_options(&pdf, options).is_ok());
+    options = LoadOptions::with_max_decompressed_size(MIB);
+    options.max_total_decompressed_size = Some(256);
+    match Document::load_mem_with_options(&pdf, options) {
+        Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => assert_eq!(limit, 256),
+        Err(other) => panic!("expected MemoryLimitExceeded, got {other:?}"),
+        Ok(_) => panic!("the total was not bounded"),
+    }
+}
+
+/// A classic table that lists the object stream (object 4) under a second number too, at the
+/// same offset. Returns the file and the length of the object stream's content.
+fn pdf_listing_an_object_stream_twice() -> (Vec<u8>, usize) {
+    let pages = "<< /Type /Pages /Kids [] /Count 0 >>";
+    let content = format!("2 0 {pages}");
+    let objects = [
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+        format!(
+            "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n{content}\nendstream\nendobj\n",
+            content.len()
+        ),
+    ];
+    let mut pdf = b"%PDF-1.5\n".to_vec();
+    let mut offsets = Vec::new();
+    for object in &objects {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(object.as_bytes());
+    }
+    let xref = pdf.len();
+    // Object 2 lives in the object stream, which the table does not say; objects 4 and 5 both
+    // point at the stream.
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 2\n0000000000 65535 f \n{:010} 00000 n \n4 2\n{:010} 00000 n \n{:010} 00000 n \ntrailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets[0], offsets[1], offsets[1]
+        )
+        .as_bytes(),
+    );
+    (pdf, content.len())
+}
+
+/// An object stream that two table entries point at is unpacked once, and counted toward the
+/// total once.
+#[test]
+fn an_object_stream_listed_twice_counts_toward_the_total_once() {
+    let (pdf, decoded) = pdf_listing_an_object_stream_twice();
+    let options = LoadOptions {
+        max_total_decompressed_size: Some(decoded + decoded / 2),
+        ..LoadOptions::default()
+    };
+    let doc = Document::load_mem_with_options(&pdf, options).unwrap();
+    assert!(doc.objects.contains_key(&(2, 0)));
+}
+
+/// A file written with a cross-reference stream and no object streams, whose `startxref` points
+/// at nothing, so a load finds the stream by scanning.
+fn xref_stream_pdf_needing_a_scan() -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages = doc.add_object(dictionary! { "Type" => "Pages", "Kids" => vec![], "Count" => 0 });
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference(pages) });
+    doc.trailer.set("Root", Object::Reference(catalog));
+    let options = lopdf::SaveOptions::builder()
+        .use_xref_streams(true)
+        .use_object_streams(false)
+        .build();
+    let mut pdf = Vec::new();
+    doc.save_with_options(&mut pdf, options).unwrap();
+    assert!(!pdf.windows(7).any(|window| window == b"trailer"));
+    let startxref = pdf.windows(9).rposition(|window| window == b"startxref").unwrap();
+    pdf.truncate(startxref);
+    pdf.extend_from_slice(b"startxref\n9\n%%EOF\n");
+    pdf
+}
+
+/// The cross-reference stream that a rebuilt table is found in counts toward the total.
+#[test]
+fn a_scanned_cross_reference_stream_counts_toward_the_total() {
+    let pdf = xref_stream_pdf_needing_a_scan();
+    let doc = Document::load_mem(&pdf).unwrap();
+    assert!(doc.xref_recovery.is_some());
+    let options = LoadOptions {
+        max_total_decompressed_size: Some(1),
+        ..LoadOptions::default()
+    };
+    match Document::load_mem_with_options(&pdf, options) {
+        Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => assert_eq!(limit, 1),
+        other => panic!("expected MemoryLimitExceeded, got {other:?}"),
+    }
+}
+
+/// A file whose objects all sit after an inserted line: its table reads, nothing it points
+/// at loads, and lenient loading rebuilds the table by scanning (upstream #636). The rebuilt
+/// load decodes an object stream the first load never reached.
+fn shifted_pdf_with_object_stream(padding: usize) -> Vec<u8> {
+    let mut members = b"10 0 ".to_vec();
+    let first = members.len();
+    members.extend_from_slice(format!("<< /Pad ({}) >>", "a".repeat(padding)).as_bytes());
+    let compressed = zlib_compress(&members);
+
+    let mut pdf = b"%PDF-1.5\n".to_vec();
+    let mut offsets = Vec::new();
+    for (number, body) in [
+        (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>".to_string()),
+    ] {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Type /ObjStm /N 1 /First {first} /Filter /FlateDecode /Length {} >>\nstream\n",
+            compressed.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(&compressed);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let inserted = b"% a line added after the cross-reference table was written\n";
+    pdf.splice(9..9, inserted.iter().copied());
+
+    let startxref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes());
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n").as_bytes());
+    pdf
+}
+
+/// The total bounds the load that rebuilds the cross-reference table too: that load decodes
+/// streams again, and a limit it reaches fails the load rather than falling back to the
+/// table that missed its objects. Measured before the fix: the rebuild ran with no total and
+/// the load succeeded.
+#[test]
+fn the_total_bounds_a_rebuilt_load() {
+    let pdf = shifted_pdf_with_object_stream(4096);
+    let document = Document::load_mem_with_options(&pdf, LoadOptions::default()).unwrap();
+    assert_eq!(document.get_pages().len(), 1, "the rebuild should find the page tree");
+    assert!(
+        document.objects.contains_key(&(10, 0)),
+        "the rebuild should decode the object stream"
+    );
+
+    let options = LoadOptions {
+        max_total_decompressed_size: Some(1024),
+        ..LoadOptions::default()
+    };
+    match Document::load_mem_with_options(&pdf, options) {
+        Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => assert_eq!(limit, 1024),
+        Err(other) => panic!("expected MemoryLimitExceeded, got {other:?}"),
+        Ok(_) => panic!("the rebuilt load was not bounded by the total"),
     }
 }
