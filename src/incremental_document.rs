@@ -60,14 +60,22 @@ impl IncrementalDocument {
     /// Get the page's resource dictionary (only in new document).
     ///
     /// Get Object that has the key `Resources`.
+    ///
+    /// A page without its own `/Resources` gets a copy of the one it inherits from the page
+    /// tree, if any, so that adding a resource does not hide the inherited ones.
     pub fn get_or_create_resources(&mut self, page_id: ObjectId) -> Result<&mut Object> {
         self.opt_clone_object_to_new_document(page_id)?;
-        let resources_id = {
+        let (resources_id, inherited) = {
             let page = self.new_document.get_object(page_id).and_then(Object::as_dict)?;
             if page.has(b"Resources") {
-                page.get(b"Resources").and_then(Object::as_reference).ok()
+                (page.get(b"Resources").and_then(Object::as_reference).ok(), None)
             } else {
-                None
+                // The page tree may be partly or entirely in the previous documents.
+                let inherited = self
+                    .new_document
+                    .inherited_resources(page)
+                    .or_else(|_| self.prev_documents.inherited_resources(page));
+                (None, inherited.ok().flatten().cloned())
             }
         };
         if let Some(res_id) = resources_id {
@@ -79,7 +87,7 @@ impl IncrementalDocument {
             .get_object_mut(page_id)
             .and_then(Object::as_dict_mut)?;
         if !page.has(b"Resources") {
-            page.set(b"Resources", Dictionary::new());
+            page.set(b"Resources", inherited.unwrap_or_default());
         }
         page.get_mut(b"Resources")
     }
@@ -95,11 +103,8 @@ impl IncrementalDocument {
                 resources.set("XObject", Dictionary::new());
             }
             let mut xobjects = resources.get_mut(b"XObject")?;
-            if let Object::Reference(xobjects_ref_id) = xobjects {
-                let mut xobjects_id = *xobjects_ref_id;
-                while let Object::Reference(id) = self.new_document.get_object(xobjects_id)? {
-                    xobjects_id = *id;
-                }
+            if let Object::Reference(xobjects_id) = *xobjects {
+                self.opt_clone_object_to_new_document(xobjects_id)?;
                 xobjects = self.new_document.get_object_mut(xobjects_id)?;
             }
             let xobjects = Object::as_dict_mut(xobjects)?;
@@ -118,7 +123,12 @@ impl IncrementalDocument {
             if !resources.has(b"ExtGState") {
                 resources.set("ExtGState", Dictionary::new());
             }
-            let states = resources.get_mut(b"ExtGState").and_then(Object::as_dict_mut)?;
+            let mut states = resources.get_mut(b"ExtGState")?;
+            if let Object::Reference(states_id) = *states {
+                self.opt_clone_object_to_new_document(states_id)?;
+                states = self.new_document.get_object_mut(states_id)?;
+            }
+            let states = Object::as_dict_mut(states)?;
             states.set(gs_name, Object::Reference(gs_id));
         }
         Ok(())
