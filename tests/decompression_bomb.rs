@@ -405,6 +405,50 @@ fn total_decompressed_size_is_bounded_across_streams() {
     }
 }
 
+/// A classic table that lists the object stream (object 4) under a second number too, at the
+/// same offset. Returns the file and the length of the object stream's content.
+fn pdf_listing_an_object_stream_twice() -> (Vec<u8>, usize) {
+    let pages = "<< /Type /Pages /Kids [] /Count 0 >>";
+    let content = format!("2 0 {pages}");
+    let objects = [
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+        format!(
+            "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n{content}\nendstream\nendobj\n",
+            content.len()
+        ),
+    ];
+    let mut pdf = b"%PDF-1.5\n".to_vec();
+    let mut offsets = Vec::new();
+    for object in &objects {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(object.as_bytes());
+    }
+    let xref = pdf.len();
+    // Object 2 lives in the object stream, which the table does not say; objects 4 and 5 both
+    // point at the stream.
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 2\n0000000000 65535 f \n{:010} 00000 n \n4 2\n{:010} 00000 n \n{:010} 00000 n \ntrailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets[0], offsets[1], offsets[1]
+        )
+        .as_bytes(),
+    );
+    (pdf, content.len())
+}
+
+/// An object stream that two table entries point at is unpacked once, and counted toward the
+/// total once.
+#[test]
+fn an_object_stream_listed_twice_counts_toward_the_total_once() {
+    let (pdf, decoded) = pdf_listing_an_object_stream_twice();
+    let options = LoadOptions {
+        max_total_decompressed_size: Some(decoded + decoded / 2),
+        ..LoadOptions::default()
+    };
+    let doc = Document::load_mem_with_options(&pdf, options).unwrap();
+    assert!(doc.objects.contains_key(&(2, 0)));
+}
+
 /// A file whose objects all sit after an inserted line: its table reads, nothing it points
 /// at loads, and lenient loading rebuilds the table by scanning (upstream #636). The rebuilt
 /// load decodes an object stream the first load never reached.

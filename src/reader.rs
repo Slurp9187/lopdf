@@ -1131,7 +1131,12 @@ impl<'a> Reader<'a> {
                 }
 
                 if let Ok(stream) = object.as_stream() {
+                    // Unpacked at the offset's first entry only: a second decode would count the
+                    // stream toward the total twice, and its members are kept from the first.
                     if stream.dict.has_type(b"ObjStm") && !is_encrypted {
+                        if !is_first {
+                            return Ok(is_last.then_some((object_id, object)));
+                        }
                         let obj_stream = match self.decode_object_stream(stream) {
                             Ok(obj_stream) => obj_stream,
                             // Resource limits apply even when malformed objects may be skipped.
