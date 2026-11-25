@@ -2,17 +2,13 @@
 <a name="unreleased"></a>
 ## [Unreleased](https://github.com/J-F-Liu/lopdf/compare/v0.45.0...HEAD)
 * Wipe the file encryption key when an `EncryptionState` (or a clone of it) is dropped
-* Redact the key, the passwords and the password-derived `/O`, `/U`, `/OE`, `/UE` and `/Perms` values from the `Debug` output of `EncryptionState` and `EncryptionVersion`, and so from a decrypted `Document`'s
+* Print `***` for the password-derived `/O`, `/U`, `/OE`, `/UE` and `/Perms` values in the `Debug` output of `EncryptionState`, and so of a decrypted `Document`, as upstream already does for the key and the passwords
 * Wipe the password a loader was given, and the sanitized and recovered passwords and intermediate keys derived from it, once they are no longer needed
 * Enable the `zeroize` features of `aes`, `cbc`, `ecb`, `md-5` and `sha2`, which wipe cipher key schedules and hash state
 * Treat `/Identity` and an absent `/StmF`, `/StrF` or stream `/Crypt` name as the Identity crypt filter from V4 on, instead of RC4; find a stream's `/Crypt` parameters in a `/DecodeParms` array; refuse a crypt filter name that is not in `/CF`. `get_stream_filter` and `get_string_filter` now return a `Result`
-* An object freed by an incremental update stays freed when its older copy lives in an object stream, rather than being recovered from the stream; a free entry of generation 65535 is kept as `UnusableFree`, and a cross-reference stream entry of an unknown type hides an older section's entry as a free one does
 * Fail loading an encrypted document when an object fails to decrypt, such as an AES string whose length is not a multiple of 16, instead of keeping its ciphertext; leave a signature dictionary's `/Contents` unencrypted and undecrypted, as the spec requires
 * Decrypt embedded file streams with the `/EFF` crypt filter, which was ignored: an embedded file is a stream a file specification's `/EF` names, or one with `/Type /EmbeddedFile`, and a stream's own `/Crypt` filter still wins
-* Write `/Length 256` in a V5 `/Encrypt` dictionary and `/Length 32` in an AESV3 crypt filter, which LibreOffice needs to show an AES-256 document's pages
-* Hold a real as an `f64`, so a value such as `595.303937007874` is saved as it was read instead of rounded to `595.30396`. `Object::Real` now holds an `f64`; `as_f64` is new, and `as_f32` and `as_float` still return an `f32`
 * Add `Document::save_encrypted`, which encrypts while it writes, so an encrypted document can keep object streams: each object stream is packed from plaintext and encrypted as a whole. `encrypt` followed by a save still writes every object on its own. A signature dictionary is kept out of object streams, so its `/Contents` stays unencrypted
-* Write a whole-number real with its point (`0.0`, `5.0`), so it reads back as a real instead of an integer. Every writer path goes through `Writer::write_object`: a save, an incremental update, an object stream and a content stream's operands. NaN and the infinities are written as before
 
 <a name="v0.45.0"></a>
 ## [v0.45.0](https://github.com/J-F-Liu/lopdf/compare/v0.44.0...v0.45.0) (2026-09-08)

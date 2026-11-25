@@ -43,6 +43,18 @@ impl From<CMapParseError> for UnicodeCMapError {
 impl ToUnicodeCMap {
     const REPLACEMENT_CHAR: u16 = 0xfffd;
 
+    /// The most entries [`build_reverse_map`](Self::build_reverse_map) will create.
+    ///
+    /// The reverse map holds one entry per source code of every `bfrange`. A `bfrange`
+    /// may declare a source-code span up to the full 4-byte range (`<00000000>
+    /// <FFFFFFFF>`), so a stream of a few hundred bytes can request billions of entries
+    /// and exhaust memory. The reverse map is only consulted when *encoding* text with a
+    /// ToUnicode CMap; text extraction and decoding never read it. Capping the number of
+    /// entries bounds the allocation while leaving every real font — whose codes number
+    /// in the thousands at most — fully mapped. 2^16 is the size of the whole two-byte
+    /// code space.
+    const MAX_REVERSE_MAP_ENTRIES: usize = 1 << 16;
+
     pub fn new() -> ToUnicodeCMap {
         ToUnicodeCMap {
             bf_ranges: [(); 4].map(|_| RangeInclusiveMap::new()),
@@ -89,11 +101,49 @@ impl ToUnicodeCMap {
             }
         }
 
-        let mut rev_map = HashMap::new();
+        cmap.build_reverse_map();
 
-        for code_len_idx in 0..cmap.bf_ranges.len() {
+        Ok(cmap)
+    }
+
+    /// The CMap to decode a simple font with. A simple font's character codes are always
+    /// one byte (ISO 32000-1, 9.6.1), but its ToUnicode CMap is often written with a two-byte
+    /// codespace and two-byte keys such as `<0041>`; read as is, two codes would be taken
+    /// for one. Each code 0..=255 is therefore looked up as a one-byte key, then as a two-byte
+    /// key, and a code the CMap does not map is taken from `fallback` (the font's /Encoding),
+    /// since ToUnicode CMaps often cover only some of a font's codes.
+    pub(crate) fn for_simple_font(&self, mut fallback: impl FnMut(u8) -> Option<Vec<u16>>) -> ToUnicodeCMap {
+        let mut cmap = Self::new();
+        for code in 0..=u8::MAX {
+            let unicode = self
+                .get(code as SourceCode, 1)
+                .or_else(|| self.get(code as SourceCode, 2))
+                .or_else(|| fallback(code));
+            if let Some(unicode) = unicode {
+                cmap.put_char(code as SourceCode, 1, unicode);
+            }
+        }
+        cmap.codespace_ranges.push((0x00, 0xFF, 1));
+        cmap.build_reverse_map();
+        cmap
+    }
+
+    /// This CMap read with the codespace of a composite font whose codes are two bytes, as the
+    /// `Identity-H` and `Identity-V` CMaps give them. ISO 32000-1, 9.10.3, requires a ToUnicode
+    /// CMap's codespace to match the font's CMap, but some producers write ranges that do not, such
+    /// as `<0000> <4C4F>` for a font whose codes run past `4F` in their second byte.
+    pub(crate) fn with_two_byte_codespace(mut self) -> ToUnicodeCMap {
+        self.codespace_ranges = vec![(0x0000, 0xFFFF, 2)];
+        self
+    }
+
+    fn build_reverse_map(&mut self) {
+        let mut rev_map = HashMap::new();
+        let mut entries = 0usize;
+
+        'ranges: for (code_len_idx, ranges) in self.bf_ranges.iter().enumerate() {
             let code_len = (code_len_idx + 1) as u8;
-            for (range, target) in cmap.bf_ranges[code_len_idx].iter() {
+            for (range, target) in ranges.iter() {
                 for src_code in range.clone() {
                     let unicode_sequence: Option<Vec<u16>> = match target {
                         BfRangeTarget::UTF16CodePoint { offset } => {
@@ -138,13 +188,20 @@ impl ToUnicodeCMap {
                             source_code: src_code,
                             code_len,
                         });
+                        entries += 1;
+                        if entries >= Self::MAX_REVERSE_MAP_ENTRIES {
+                            error!(
+                                "ToUnicode CMap bfrange reverse map reached the {} entry cap; \
+                                 the remaining source codes are left unmapped for reverse lookup",
+                                Self::MAX_REVERSE_MAP_ENTRIES
+                            );
+                            break 'ranges;
+                        }
                     }
                 }
             }
         }
-        cmap.reverse_map = Some(rev_map);
-
-        Ok(cmap)
+        self.reverse_map = Some(rev_map);
     }
 
     pub(super) fn get_for_decoding(&self, code: SourceCode, code_len: CodeLen) -> Option<Vec<u16>> {
@@ -244,6 +301,38 @@ pub enum BfRangeTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reverse_map_entries(cmap: &ToUnicodeCMap) -> usize {
+        cmap.reverse_map.as_ref().unwrap().values().map(|v| v.len()).sum()
+    }
+
+    fn cmap_with_bfrange(lo_hi: &str) -> ToUnicodeCMap {
+        let data = format!(
+            "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+             /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+             1 begincodespacerange\n<00000000> <FFFFFFFF>\nendcodespacerange\n\
+             1 beginbfrange\n{lo_hi} <0041>\nendbfrange\n\
+             endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend"
+        );
+        ToUnicodeCMap::parse(data.into_bytes()).unwrap()
+    }
+
+    // Regression: a `bfrange` declares a source-code span, and `build_reverse_map` used
+    // to create one entry per source code with the only guard being `end < start`. A
+    // span covering the whole 4-byte code space (`<00000000> <FFFFFFFF>`) therefore
+    // requested ~4.29e9 entries (tens of GiB) from a ~150-byte stream, reachable from
+    // `Document::extract_text`. The reverse map is now capped.
+    #[test]
+    fn bfrange_reverse_map_is_bounded() {
+        // A small range is mapped in full.
+        assert_eq!(reverse_map_entries(&cmap_with_bfrange("<00000000> <00000FFF>")), 4096);
+        // The full 4-byte range would be ~4.29e9 entries without the cap; it must not be.
+        let full = cmap_with_bfrange("<00000000> <FFFFFFFF>");
+        assert!(
+            reverse_map_entries(&full) <= ToUnicodeCMap::MAX_REVERSE_MAP_ENTRIES,
+            "reverse map must be bounded by MAX_REVERSE_MAP_ENTRIES"
+        );
+    }
 
     #[test]
     fn put_char_can_be_retrieved() {

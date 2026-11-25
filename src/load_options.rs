@@ -6,10 +6,19 @@ use crate::Object;
 /// and returns `Some((id, object))` to keep it or `None` to discard it.
 pub type FilterFunc = fn((u32, u16), &mut Object) -> Option<((u32, u16), Object)>;
 
+/// The default bound, in bytes, on how large a single stream may decompress to
+/// when loading a document or extracting its text: 256 MiB.
+///
+/// This is far above what real object, cross-reference, and page content streams
+/// need, and it keeps a small crafted file from inflating to gigabytes. Pass a
+/// larger value, or `None` in [`LoadOptions::max_decompressed_size`], to lift it.
+pub const DEFAULT_MAX_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024;
+
 /// Options for loading PDF documents.
 ///
 /// Use this struct to configure password, object filtering, and strictness
-/// when loading a PDF. The default is lenient parsing with no password or filter.
+/// when loading a PDF. The default is lenient parsing with no password or filter,
+/// and with stream decompression bounded by [`DEFAULT_MAX_DECOMPRESSED_SIZE`].
 ///
 /// # Examples
 ///
@@ -28,7 +37,7 @@ pub type FilterFunc = fn((u32, u16), &mut Object) -> Option<((u32, u16), Object)
 ///     LoadOptions { strict: true, ..Default::default() },
 /// );
 /// ```
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct LoadOptions {
     /// Password for encrypted PDFs.
     pub password: Option<String>,
@@ -44,11 +53,11 @@ pub struct LoadOptions {
     /// Compression filters can inflate a tiny input into an enormous output (a
     /// "decompression bomb"). Because object and xref streams are decoded eagerly
     /// while the document is loaded, an unbounded stream can exhaust memory
-    /// before any of your code runs. Set this to bound that per-stream cost when
-    /// loading untrusted PDFs; a stream that would exceed it fails with
-    /// [`crate::DecompressError::MemoryLimitExceeded`].
+    /// before any of your code runs. This bounds that per-stream cost; a stream
+    /// that would exceed it fails with [`crate::DecompressError::MemoryLimitExceeded`].
     ///
-    /// `None` (the default) applies no limit.
+    /// Defaults to [`DEFAULT_MAX_DECOMPRESSED_SIZE`]. `None` applies no limit; use it
+    /// only for PDFs from a trusted source.
     pub max_decompressed_size: Option<usize>,
     /// Maximum number of bytes all the streams decoded during loading may
     /// decompress to together (object streams and cross-reference streams).
@@ -67,6 +76,28 @@ pub struct LoadOptions {
     ///
     /// [`Document::xref_recovery`]: crate::Document::xref_recovery
     pub force_reconstruct: bool,
+    /// Most cross-reference entries kept across all of a file's sections (its
+    /// `/Prev` chain and any `/XRefStm`). A small file can list millions of
+    /// entries, since a compressed cross-reference row is a few bytes, and every
+    /// entry is kept in memory. A file over it fails with
+    /// [`crate::XrefError::TooManyEntries`] and is not rebuilt by scanning.
+    ///
+    /// Defaults to `None`, no limit.
+    pub max_xref_entries: Option<usize>,
+}
+
+impl Default for LoadOptions {
+    fn default() -> Self {
+        Self {
+            password: None,
+            filter: None,
+            strict: false,
+            max_decompressed_size: Some(DEFAULT_MAX_DECOMPRESSED_SIZE),
+            max_total_decompressed_size: None,
+            force_reconstruct: false,
+            max_xref_entries: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for LoadOptions {
@@ -78,6 +109,7 @@ impl std::fmt::Debug for LoadOptions {
             .field("max_decompressed_size", &self.max_decompressed_size)
             .field("max_total_decompressed_size", &self.max_total_decompressed_size)
             .field("force_reconstruct", &self.force_reconstruct)
+            .field("max_xref_entries", &self.max_xref_entries)
             .finish()
     }
 }

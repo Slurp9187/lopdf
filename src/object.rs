@@ -80,6 +80,9 @@ pub enum Object {
     Null,
     Boolean(bool),
     Integer(i64),
+    /// A real number, held as `f64` so a value read from a file keeps every digit it was
+    /// written with: an `f32` holds about seven significant digits, and font widths such as
+    /// `666.99219` lost their last ones on load.
     Real(f64),
     Name(Vec<u8>),
     String(Vec<u8>, StringFormat),
@@ -151,11 +154,11 @@ impl From<f64> for Object {
     }
 }
 
+/// Widens through the shortest decimal that reads back as the same `f32`, so `0.1f32` becomes
+/// the real `0.1` and is written as `0.1`, not as `0.10000000149011612`, which `as f64` gives.
 impl From<f32> for Object {
-    /// Keeps the decimal the `f32` stands for: widened bit for bit, `0.1f32` would be written
-    /// as `0.10000000149011612`.
     fn from(number: f32) -> Self {
-        Object::Real(number.to_string().parse().unwrap_or(f64::from(number)))
+        Object::Real(number.to_string().parse().unwrap_or(number as f64))
     }
 }
 
@@ -211,7 +214,7 @@ impl Object {
 
     /// Get the object value as a float.
     /// Unlike [`Object::as_f32`] this will also cast an Integer to a Real.
-    /// [`Object::as_f64`] keeps a real's full precision.
+    /// The value is rounded to `f32`; [`Object::as_float_f64`] keeps every digit.
     pub fn as_float(&self) -> Result<f32> {
         match self {
             Object::Integer(value) => Ok(*value as f32),
@@ -220,7 +223,16 @@ impl Object {
         }
     }
 
-    /// A real, rounded to `f32`. [`Object::as_f64`] keeps its full precision.
+    /// Get the object value as an `f64`, casting an Integer to a Real.
+    pub fn as_float_f64(&self) -> Result<f64> {
+        match self {
+            Object::Integer(value) => Ok(*value as f64),
+            Object::Real(value) => Ok(*value),
+            _ => Err(self.type_error("Integer or Real")),
+        }
+    }
+
+    /// Get a Real rounded to `f32`; [`Object::as_f64`] keeps every digit.
     pub fn as_f32(&self) -> Result<f32> {
         self.as_f64().map(|value| value as f32)
     }
@@ -417,12 +429,25 @@ impl Dictionary {
         // predefined CJK CMAPs other than those in SimpleEncoding; and the fallback
         // font when `BaseEncoding` is undefined (Table 114, 9.6.6.1).
         let result = (|| {
-            if let Ok(object) = self.get(b"Encoding") {
-                return self.get_base_encoding(object, doc, limit);
+            // A ToUnicode CMap is the first method for mapping character codes to Unicode
+            // (ISO 32000-1, 9.10.2), so it wins over /Encoding; /Encoding is used when the
+            // font has no ToUnicode CMap or it cannot be read.
+            if let Ok(stream) = self.get_deref(b"ToUnicode", doc).and_then(Object::as_stream) {
+                match self.get_to_unicode_encoding(stream, limit) {
+                    Ok(Encoding::UnicodeMapEncoding(cmap)) if self.is_simple_font() => {
+                        return self.get_simple_font_unicode_encoding(&cmap, doc, limit);
+                    }
+                    Ok(Encoding::UnicodeMapEncoding(cmap)) if self.has_identity_encoding() => {
+                        return Ok(Encoding::UnicodeMapEncoding(cmap.with_two_byte_codespace()));
+                    }
+                    Ok(encoding) => return Ok(encoding),
+                    Err(err @ Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => return Err(err),
+                    Err(err) => warn!("Could not parse the ToUnicode CMap, error: {err:#?}. Using /Encoding instead."),
+                }
             }
 
-            if let Ok(stream) = self.get_deref(b"ToUnicode", doc).and_then(Object::as_stream) {
-                return self.get_to_unicode_encoding(stream, limit);
+            if let Ok(object) = self.get(b"Encoding") {
+                return self.get_base_encoding(object, doc, limit);
             }
 
             Ok(Encoding::OneByteEncoding(&encodings::STANDARD_ENCODING))
@@ -440,6 +465,46 @@ impl Dictionary {
                 Ok(Encoding::OneByteEncoding(&encodings::STANDARD_ENCODING))
             }
         }
+    }
+
+    /// Whether this is a simple font, whose character codes are one byte (ISO 32000-1, 9.6.1).
+    fn is_simple_font(&self) -> bool {
+        matches!(
+            self.get(b"Subtype").and_then(Object::as_name),
+            Ok(b"Type1" | b"MMType1" | b"TrueType" | b"Type3")
+        )
+    }
+
+    /// Whether this is a composite font encoded `Identity-H` or `Identity-V`, whose character codes
+    /// are two bytes (ISO 32000-1, 9.7.5.2).
+    fn has_identity_encoding(&self) -> bool {
+        self.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Type0".as_slice())
+            && matches!(
+                self.get(b"Encoding").and_then(Object::as_name),
+                Ok(b"Identity-H" | b"Identity-V")
+            )
+    }
+
+    /// The encoding of a simple font that has a ToUnicode CMap. 9.10.2 orders the methods
+    /// per code, so a code the CMap leaves out is mapped through /Encoding, or through
+    /// StandardEncoding when /Encoding cannot be read (as before). A code that /Encoding
+    /// has no character for maps to nothing, as before.
+    fn get_simple_font_unicode_encoding<'a>(
+        &'a self, cmap: &ToUnicodeCMap, doc: &'a Document, limit: Option<usize>,
+    ) -> Result<Encoding<'a>> {
+        let fallback = match self.get(b"Encoding") {
+            Ok(object) => match self.get_base_encoding(object, doc, limit) {
+                Ok(encoding) => Some(encoding),
+                Err(err @ Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => return Err(err),
+                Err(_) => Some(Encoding::OneByteEncoding(&encodings::STANDARD_ENCODING)),
+            },
+            Err(_) => None,
+        };
+        let cmap = cmap.for_simple_font(|code| {
+            let text = fallback.as_ref()?.bytes_to_string(&[code]).ok()?;
+            Some(text.encode_utf16().collect())
+        });
+        Ok(Encoding::UnicodeMapEncoding(cmap))
     }
 
     /// Get a simple encoding from the /Encoding entry of a font dictionary.
@@ -907,12 +972,12 @@ impl Stream {
                 _ => None,
             };
             output = match filter {
-                b"FlateDecode" => Self::decompress_zlib(input, params, limit)?,
+                b"FlateDecode" | b"Fl" => Self::decompress_zlib(input, params, limit)?,
                 b"BrotliDecode" => Self::decompress_brotli(input, limit)?,
-                b"LZWDecode" => Self::decompress_lzw(input, params, limit)?,
-                b"ASCII85Decode" => Self::decode_ascii85(input, limit)?,
-                b"ASCIIHexDecode" => Self::decode_ascii_hex(input, limit)?,
-                b"RunLengthDecode" => Self::decode_run_length(input, limit)?,
+                b"LZWDecode" | b"LZW" => Self::decompress_lzw(input, params, limit)?,
+                b"ASCII85Decode" | b"A85" => Self::decode_ascii85(input, limit)?,
+                b"ASCIIHexDecode" | b"AHx" => Self::decode_ascii_hex(input, limit)?,
+                b"RunLengthDecode" | b"RL" => Self::decode_run_length(input, limit)?,
                 _ => return Err(Error::Unimplemented("decompression algorithms")),
             };
             reject_over_limit(output.len(), limit)?;

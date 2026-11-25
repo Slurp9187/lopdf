@@ -356,6 +356,43 @@ startxref
         );
     }
 
+    /// Appends an incremental update to `buffer` whose only change is to free object 3, using a
+    /// classic `xref` table, and returns the updated file.
+    #[cfg(not(feature = "async"))]
+    fn free_object_3_with_table(mut buffer: Vec<u8>, prev: usize) -> Vec<u8> {
+        let xref_pos = buffer.len();
+        buffer.extend_from_slice(
+            format!(
+                "xref\n3 1\n0000000000 00001 f\ntrailer\n<< /Size 6 /Root 1 0 R /Prev {prev} >>\nstartxref\n{xref_pos}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        buffer
+    }
+
+    /// A classic-table file whose object 3 is a dictionary nothing refers to. Returns the file and
+    /// the offset of its `xref` table.
+    #[cfg(not(feature = "async"))]
+    fn classic_file_with_object_3() -> (Vec<u8>, usize) {
+        let header = "%PDF-1.4\n";
+        let objects = [
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n",
+            "3 0 obj\n<< /Marker (freed by a later update) >>\nendobj\n",
+        ];
+        let mut buffer = header.as_bytes().to_vec();
+        let mut table = String::from("xref\n0 4\n0000000000 65535 f \n");
+        for object in objects {
+            table.push_str(&format!("{:010} 00000 n \n", buffer.len()));
+            buffer.extend_from_slice(object.as_bytes());
+        }
+        let xref_pos = buffer.len();
+        buffer.extend_from_slice(
+            format!("{table}trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n").as_bytes(),
+        );
+        (buffer, xref_pos)
+    }
+
     #[cfg(not(feature = "async"))]
     #[test]
     fn hybrid_sections_and_freed_objects_follow_the_reader() {
@@ -364,7 +401,7 @@ startxref
         assert_eq!(index_entries(&index), reader_entries(&hybrid));
         assert!(index.get(3).is_some_and(|entry| entry.is_compressed()));
 
-        let freed = crate::reader::free_object_3_with_table(hybrid, prev);
+        let freed = free_object_3_with_table(hybrid, prev);
         let index = super::read_index(&mut Source::new(Cursor::new(freed.clone())).unwrap(), &Caps::default()).unwrap();
         assert_eq!(index_entries(&index), reader_entries(&freed));
         assert!(
@@ -373,8 +410,8 @@ startxref
                 .is_some_and(|entry| !entry.is_normal() && !entry.is_compressed())
         );
 
-        let (classic, prev) = crate::reader::classic_file_with_object_3();
-        let freed = crate::reader::free_object_3_with_table(classic, prev);
+        let (classic, prev) = classic_file_with_object_3();
+        let freed = free_object_3_with_table(classic, prev);
         let index = super::read_index(&mut Source::new(Cursor::new(freed.clone())).unwrap(), &Caps::default()).unwrap();
         assert_eq!(index_entries(&index), reader_entries(&freed));
         assert!(index.get(3).is_some_and(|entry| !entry.is_normal()));

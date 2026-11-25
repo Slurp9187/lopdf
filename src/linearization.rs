@@ -14,7 +14,7 @@ pub struct Linearization {
     /// The object that holds the dictionary.
     pub id: ObjectId,
     /// `/Linearized`: the version of the linearization format.
-    pub version: f64,
+    pub version: f32,
     /// `/L`: the length of the file in bytes when it was linearized.
     pub file_length: u64,
     /// `/H`: the offset and length of the primary hint stream, then of the
@@ -38,8 +38,8 @@ impl Linearization {
     /// linearization parameter dictionary or a required entry is missing.
     pub fn from_dictionary(id: ObjectId, dict: &Dictionary) -> Option<Self> {
         let version = match dict.get(b"Linearized").ok()? {
-            Object::Integer(version) => *version as f64,
-            Object::Real(version) => *version,
+            Object::Integer(version) => *version as f32,
+            Object::Real(version) => *version as f32,
             _ => return None,
         };
         let unsigned = |key: &[u8]| -> Option<u64> {
