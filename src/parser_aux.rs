@@ -5,7 +5,7 @@ use crate::{
     content::{Content, Operation},
     document::Document,
     encodings::Encoding,
-    error::ParseError,
+    error::{ParseError, XrefError},
     object::Object::Name,
     xref::{Xref, XrefEntry, XrefType},
 };
@@ -571,7 +571,15 @@ pub fn decode_xref_stream(stream: Stream) -> Result<(Xref, Dictionary)> {
 /// streams are decoded early during loading, so this bounds the memory a `/XRef`
 /// stream can use.
 pub fn decode_xref_stream_with_limit(
-    mut stream: Stream, max_decompressed_size: Option<usize>,
+    stream: Stream, max_decompressed_size: Option<usize>,
+) -> Result<(Xref, Dictionary)> {
+    decode_xref_stream_bounded(stream, max_decompressed_size, None)
+}
+
+/// [`decode_xref_stream_with_limit`] that also fails with [`XrefError::TooManyEntries`] when the
+/// stream lists more than `max_entries` entries, before it holds any of them.
+pub(crate) fn decode_xref_stream_bounded(
+    mut stream: Stream, max_decompressed_size: Option<usize>, max_entries: Option<usize>,
 ) -> Result<(Xref, Dictionary)> {
     if stream.is_compressed() {
         match max_decompressed_size {
@@ -631,6 +639,11 @@ pub fn decode_xref_stream_with_limit(
         const MIN_ENTRY_WIDTH: usize = 3;
         if index_entries > reader.get_ref().len() / entry_width.max(MIN_ENTRY_WIDTH) {
             return Err(ParseError::InvalidXref.into());
+        }
+        if let Some(limit) = max_entries
+            && index_entries > limit
+        {
+            return Err(Error::Xref(XrefError::TooManyEntries { limit }));
         }
 
         let mut bytes1 = vec![0_u8; field_widths[0] as usize];
@@ -723,6 +736,27 @@ fn parse_integer_array(array: &Object) -> Result<Vec<i64>> {
 
 #[cfg(test)]
 mod tests {
+    /// A cross-reference stream listing more entries than allowed fails before any is kept.
+    #[test]
+    fn a_cross_reference_stream_over_the_entry_limit_fails_before_its_entries_are_kept() {
+        use super::decode_xref_stream_bounded;
+        use crate::{Error, Stream, XrefError};
+        let stream = || {
+            let dict = crate::dictionary! {
+                "Type" => "XRef",
+                "Size" => 3,
+                "W" => vec![1.into(), 1.into(), 1.into()],
+            };
+            Stream::new(dict, vec![0, 0, 0, 1, 9, 0, 1, 12, 0])
+        };
+        assert!(matches!(
+            decode_xref_stream_bounded(stream(), None, Some(2)),
+            Err(Error::Xref(XrefError::TooManyEntries { limit: 2 }))
+        ));
+        let (xref, _) = decode_xref_stream_bounded(stream(), None, Some(3)).unwrap();
+        assert_eq!(xref.entries.len(), 3);
+    }
+
     #[cfg(not(feature = "async"))]
     #[test]
     fn load_and_save() {

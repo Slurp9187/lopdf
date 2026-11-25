@@ -25,7 +25,7 @@ use crate::linearization::Linearization;
 use crate::load_options::{FilterFunc, LoadOptions};
 use crate::object_stream::ObjectStream;
 use crate::parser;
-use crate::xref::{Xref, XrefEntry, XrefRecovery, XrefType, decode_xref_stream_with_limit};
+use crate::xref::{Xref, XrefEntry, XrefRecovery, XrefType};
 use crate::{Dictionary, Document, Error, IncrementalDocument, Object, ObjectId, Result};
 
 /// Open `path` and report its size, so the caller can pre-size the buffer it
@@ -1598,6 +1598,8 @@ impl<'a> Reader<'a> {
                 xref.merge_hybrid(stream_xref);
                 Ok(false)
             }
+            // A resource limit, not damage: the stream is not ignored as unreadable.
+            Err(e @ Error::Xref(XrefError::TooManyEntries { .. })) => Err(e),
             // The table alone still describes a hybrid-reference file for older readers.
             Err(e) if !self.strict => {
                 warn!("ignoring unreadable cross-reference stream at {start}: {e}");
@@ -1922,7 +1924,11 @@ impl<'a> Reader<'a> {
             if !stream.dict.has_type(b"XRef") {
                 continue;
             }
-            let (stream_xref, dictionary) = match decode_xref_stream_with_limit(stream, self.max_decompressed_size) {
+            let (stream_xref, dictionary) = match crate::parser_aux::decode_xref_stream_bounded(
+                stream,
+                self.max_decompressed_size,
+                self.max_xref_entries,
+            ) {
                 Ok(decoded) => decoded,
                 Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
                     *over_limit = true;
