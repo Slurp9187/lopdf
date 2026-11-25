@@ -7,6 +7,7 @@ use crate::{Dictionary, Document, Error, Object, ObjectId};
 use bitflags::bitflags;
 use crypt_filters::*;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -135,7 +136,8 @@ impl Permissions {
     }
 }
 
-#[derive(Clone, Debug)]
+/// `Debug` prints `***` for the passwords and the file encryption key.
+#[derive(Clone)]
 pub enum EncryptionVersion<'a> {
     /// (PDF 1.4; deprecated in PDF 2.0) Indicates the use of encryption of data using the RC4 or
     /// AES algorithms with a file encryption key length of 40 bits.
@@ -200,7 +202,9 @@ pub enum EncryptionVersion<'a> {
     },
 }
 
-#[derive(Clone, Debug, Default)]
+/// `Debug` prints `***` for the file encryption key. Use
+/// [`file_encryption_key`](Self::file_encryption_key) to read it.
+#[derive(Clone, Default)]
 pub struct EncryptionState {
     pub(crate) version: i64,
     pub(crate) revision: i64,
@@ -221,6 +225,140 @@ pub struct EncryptionState {
     /// trailer. Used by `IncrementalDocument` to restore the `/Encrypt` reference
     /// in the appended trailer.
     pub(crate) encrypt_object_id: Option<ObjectId>,
+}
+
+impl fmt::Debug for EncryptionVersion<'_> {
+    #[allow(deprecated)]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::V1 {
+                document,
+                owner_password: _,
+                user_password: _,
+                permissions,
+            } => f
+                .debug_struct("V1")
+                .field("document", document)
+                .field("owner_password", &"***")
+                .field("user_password", &"***")
+                .field("permissions", permissions)
+                .finish(),
+            Self::V2 {
+                document,
+                owner_password: _,
+                user_password: _,
+                key_length,
+                permissions,
+            } => f
+                .debug_struct("V2")
+                .field("document", document)
+                .field("owner_password", &"***")
+                .field("user_password", &"***")
+                .field("key_length", key_length)
+                .field("permissions", permissions)
+                .finish(),
+            Self::V4 {
+                document,
+                encrypt_metadata,
+                crypt_filters,
+                stream_filter,
+                string_filter,
+                owner_password: _,
+                user_password: _,
+                permissions,
+            } => f
+                .debug_struct("V4")
+                .field("document", document)
+                .field("encrypt_metadata", encrypt_metadata)
+                .field("crypt_filters", crypt_filters)
+                .field("stream_filter", stream_filter)
+                .field("string_filter", string_filter)
+                .field("owner_password", &"***")
+                .field("user_password", &"***")
+                .field("permissions", permissions)
+                .finish(),
+            Self::R5 {
+                encrypt_metadata,
+                crypt_filters,
+                file_encryption_key: _,
+                stream_filter,
+                string_filter,
+                owner_password: _,
+                user_password: _,
+                permissions,
+            } => f
+                .debug_struct("R5")
+                .field("encrypt_metadata", encrypt_metadata)
+                .field("crypt_filters", crypt_filters)
+                .field("file_encryption_key", &"***")
+                .field("stream_filter", stream_filter)
+                .field("string_filter", string_filter)
+                .field("owner_password", &"***")
+                .field("user_password", &"***")
+                .field("permissions", permissions)
+                .finish(),
+            Self::V5 {
+                encrypt_metadata,
+                crypt_filters,
+                file_encryption_key: _,
+                stream_filter,
+                string_filter,
+                owner_password: _,
+                user_password: _,
+                permissions,
+            } => f
+                .debug_struct("V5")
+                .field("encrypt_metadata", encrypt_metadata)
+                .field("crypt_filters", crypt_filters)
+                .field("file_encryption_key", &"***")
+                .field("stream_filter", stream_filter)
+                .field("string_filter", string_filter)
+                .field("owner_password", &"***")
+                .field("user_password", &"***")
+                .field("permissions", permissions)
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Debug for EncryptionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Bind every field, so that a new one has to be printed or hidden here on purpose.
+        let Self {
+            version,
+            revision,
+            key_length,
+            encrypt_metadata,
+            crypt_filters,
+            file_encryption_key: _,
+            stream_filter,
+            string_filter,
+            owner_value,
+            owner_encrypted,
+            user_value,
+            user_encrypted,
+            permissions,
+            permission_encrypted,
+            encrypt_object_id,
+        } = self;
+        f.debug_struct("EncryptionState")
+            .field("version", version)
+            .field("revision", revision)
+            .field("key_length", key_length)
+            .field("encrypt_metadata", encrypt_metadata)
+            .field("crypt_filters", crypt_filters)
+            .field("file_encryption_key", &"***")
+            .field("stream_filter", stream_filter)
+            .field("string_filter", string_filter)
+            .field("owner_value", owner_value)
+            .field("owner_encrypted", owner_encrypted)
+            .field("user_value", user_value)
+            .field("user_encrypted", user_encrypted)
+            .field("permissions", permissions)
+            .field("permission_encrypted", permission_encrypted)
+            .field("encrypt_object_id", encrypt_object_id)
+            .finish()
+    }
 }
 
 /// Fields shared by the AES-256 variants (`R5` and `V5`), which differ only
@@ -661,7 +799,11 @@ impl EncryptionState {
         encrypted.set(b"V", Object::Integer(self.version));
         encrypted.set(b"R", Object::Integer(self.revision));
 
-        if let Some(key_length) = self.key_length {
+        // PDF 2.0 deprecates /Length for V 5, whose key is always 256 bits, but readers such as
+        // LibreOffice still need it: without it they decrypt to blank pages.
+        if self.version >= 5 {
+            encrypted.set(b"Length", Object::Integer(256));
+        } else if let Some(key_length) = self.key_length {
             encrypted.set(b"Length", Object::Integer(key_length as i64));
         }
 
@@ -683,6 +825,11 @@ impl EncryptionState {
 
                 filter.set(b"Type", Object::Name(b"CryptFilter".to_vec()));
                 filter.set(b"CFM", Object::Name(crypt_filter.method().to_vec()));
+
+                // The AESV3 key length in bytes, as qpdf writes it.
+                if crypt_filter.method() == b"AESV3" {
+                    filter.set(b"Length", Object::Integer(32));
+                }
 
                 filters.set(name.to_vec(), Object::Dictionary(filter));
             }
@@ -864,10 +1011,105 @@ mod tests {
     use super::rc4::Rc4;
     use crate::creator::tests::create_document;
     use crate::encryption::{Aes128CryptFilter, Aes256CryptFilter, CryptFilter};
-    use crate::{EncryptionState, EncryptionVersion, Permissions};
+    use crate::{EncryptionState, EncryptionVersion, Object, Permissions};
     use rand::RngExt as _;
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    /// Asserts that `debug` holds neither password nor a byte run of the key `[0xAB; 32]`, in
+    /// either the `{:?}` or the `{:#?}` layout.
+    fn assert_no_secrets(debug: &str) {
+        assert!(!debug.contains("owner-secret"), "{debug}");
+        assert!(!debug.contains("user-secret"), "{debug}");
+        let compact: String = debug.split_whitespace().collect();
+        assert!(!compact.contains("171,171,171,171"), "{debug}");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn debug_hides_the_passwords_and_the_file_encryption_key() {
+        let document = create_document();
+        let file_encryption_key = [0xABu8; 32];
+        let aes128: Arc<dyn CryptFilter> = Arc::new(Aes128CryptFilter);
+        let aes256: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
+        let versions = [
+            EncryptionVersion::V1 {
+                document: &document,
+                owner_password: "owner-secret",
+                user_password: "user-secret",
+                permissions: Permissions::all(),
+            },
+            EncryptionVersion::V2 {
+                document: &document,
+                owner_password: "owner-secret",
+                user_password: "user-secret",
+                key_length: 128,
+                permissions: Permissions::all(),
+            },
+            EncryptionVersion::V4 {
+                document: &document,
+                encrypt_metadata: true,
+                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes128)]),
+                stream_filter: b"StdCF".to_vec(),
+                string_filter: b"StdCF".to_vec(),
+                owner_password: "owner-secret",
+                user_password: "user-secret",
+                permissions: Permissions::all(),
+            },
+            EncryptionVersion::R5 {
+                encrypt_metadata: true,
+                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes256.clone())]),
+                file_encryption_key: &file_encryption_key,
+                stream_filter: b"StdCF".to_vec(),
+                string_filter: b"StdCF".to_vec(),
+                owner_password: "owner-secret",
+                user_password: "user-secret",
+                permissions: Permissions::all(),
+            },
+            EncryptionVersion::V5 {
+                encrypt_metadata: true,
+                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes256)]),
+                file_encryption_key: &file_encryption_key,
+                stream_filter: b"StdCF".to_vec(),
+                string_filter: b"StdCF".to_vec(),
+                owner_password: "owner-secret",
+                user_password: "user-secret",
+                permissions: Permissions::all(),
+            },
+        ];
+        for version in &versions {
+            let has_key = matches!(version, EncryptionVersion::R5 { .. } | EncryptionVersion::V5 { .. });
+            for debug in [format!("{version:?}"), format!("{version:#?}")] {
+                assert_no_secrets(&debug);
+                assert!(debug.contains("owner_password: \"***\""), "{debug}");
+                assert!(debug.contains("user_password: \"***\""), "{debug}");
+                assert_eq!(debug.contains("file_encryption_key: \"***\""), has_key, "{debug}");
+                assert!(debug.contains("permissions: "), "{debug}");
+            }
+        }
+
+        // The state hides the key, but still prints /O and /U, which the file holds anyway.
+        let [.., v5] = versions;
+        let state = EncryptionState::try_from(v5).unwrap();
+        let owner_value = format!("owner_value: {:?}", state.owner_value());
+        for debug in [format!("{state:?}"), format!("{state:#?}")] {
+            assert_no_secrets(&debug);
+            assert!(debug.contains("file_encryption_key: \"***\""), "{debug}");
+            assert!(debug.contains("revision: 6"), "{debug}");
+        }
+        assert!(format!("{state:?}").contains(&owner_value));
+
+        // A decrypted document holds the state, and so prints it too.
+        let mut document = create_document();
+        document.encrypt(&state).unwrap();
+        document.decrypt("user-secret").unwrap();
+        let decrypted_state = document.encryption_state.as_ref().unwrap();
+        assert_eq!(decrypted_state.file_encryption_key(), file_encryption_key);
+        for debug in [format!("{document:?}"), format!("{document:#?}")] {
+            assert_no_secrets(&debug);
+            assert!(debug.contains("file_encryption_key: \"***\""), "{debug}");
+        }
+    }
 
     #[test]
     fn rc4_works() {
@@ -959,6 +1201,60 @@ mod tests {
             assert!(document.encrypt(&state).is_ok());
             assert!(document.decrypt("user").is_ok());
         }
+    }
+
+    /// A V 5 encryption dictionary names its key lengths: /Length 256 in /Encrypt and
+    /// /Length 32 in the AESV3 crypt filter. LibreOffice shows blank pages without them.
+    #[test]
+    fn encode_v5_writes_key_lengths() {
+        let document = create_document();
+        let crypt_filters = |filter: Arc<dyn CryptFilter>| BTreeMap::from([(b"StdCF".to_vec(), filter)]);
+        let file_encryption_key = [7u8; 32];
+
+        let v5 = EncryptionState::try_from(EncryptionVersion::V5 {
+            encrypt_metadata: true,
+            crypt_filters: crypt_filters(Arc::new(Aes256CryptFilter)),
+            file_encryption_key: &file_encryption_key,
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_password: "owner",
+            user_password: "user",
+            permissions: Permissions::all(),
+        })
+        .unwrap()
+        .encode()
+        .unwrap();
+        assert_eq!(v5.get(b"Length").and_then(Object::as_i64).ok(), Some(256));
+        let std_cf = v5
+            .get(b"CF")
+            .and_then(Object::as_dict)
+            .and_then(|cf| cf.get(b"StdCF"))
+            .and_then(Object::as_dict)
+            .unwrap();
+        assert_eq!(std_cf.get(b"Length").and_then(Object::as_i64).ok(), Some(32));
+
+        // V 4 keeps what it wrote before: /Length 128, and none in an AESV2 filter.
+        let v4 = EncryptionState::try_from(EncryptionVersion::V4 {
+            document: &document,
+            encrypt_metadata: true,
+            crypt_filters: crypt_filters(Arc::new(Aes128CryptFilter)),
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_password: "owner",
+            user_password: "user",
+            permissions: Permissions::all(),
+        })
+        .unwrap()
+        .encode()
+        .unwrap();
+        assert_eq!(v4.get(b"Length").and_then(Object::as_i64).ok(), Some(128));
+        let std_cf = v4
+            .get(b"CF")
+            .and_then(Object::as_dict)
+            .and_then(|cf| cf.get(b"StdCF"))
+            .and_then(Object::as_dict)
+            .unwrap();
+        assert!(std_cf.get(b"Length").is_err());
     }
 
     #[test]
