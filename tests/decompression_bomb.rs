@@ -9,7 +9,8 @@ use flate2::write::ZlibEncoder;
 use std::io::Write;
 
 use lopdf::{
-    DecompressError, Dictionary, Document, Error, LoadOptions, Object, ObjectId, ObjectStream, Stream, dictionary,
+    DEFAULT_MAX_DECOMPRESSED_SIZE, DecompressError, Dictionary, Document, Error, LoadOptions, Object, ObjectId,
+    ObjectStream, Stream, dictionary,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -208,8 +209,41 @@ fn load_time_xref_stream_bomb_is_rejected_with_limit() {
     }
 }
 
+/// `Document::load_mem` uses `LoadOptions::default()`, which bounds decompression, so
+/// an xref-stream bomb just over the default limit is rejected without any opt-in.
+#[test]
+fn load_time_xref_stream_bomb_is_rejected_by_default() {
+    let pdf = xref_stream_bomb_pdf(&flate_bomb(DEFAULT_MAX_DECOMPRESSED_SIZE + MIB));
+
+    match Document::load_mem(&pdf) {
+        Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => {
+            assert_eq!(limit, DEFAULT_MAX_DECOMPRESSED_SIZE);
+        }
+        Err(other) => panic!("expected MemoryLimitExceeded during default load, got {other:?}"),
+        Ok(_) => panic!("bomb PDF loaded without hitting the default decompression limit"),
+    }
+}
+
+/// The standalone `decode_xref_stream` helper applies the same default bound.
+#[test]
+fn decode_xref_stream_rejects_bomb_by_default() {
+    let mut stream = flate_stream(flate_bomb(DEFAULT_MAX_DECOMPRESSED_SIZE + MIB));
+    stream.dict.set("Type", "XRef");
+    stream.dict.set("Size", 1i64);
+    stream
+        .dict
+        .set("W", vec![Object::from(1i64), Object::from(1i64), Object::from(1i64)]);
+
+    match lopdf::xref::decode_xref_stream(stream).map(|_| ()) {
+        Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => {
+            assert_eq!(limit, DEFAULT_MAX_DECOMPRESSED_SIZE);
+        }
+        other => panic!("expected MemoryLimitExceeded, got {other:?}"),
+    }
+}
+
 // `get_page_content_with_limit` bounds the whole concatenated page content, unlike
-// the per-stream-unbounded `get_page_content` used by `extract_text`.
+// the per-stream-unbounded `get_page_content`.
 
 /// Build a single-page document whose `/Contents` is the given streams, and
 /// return the document plus the page's object id. No page tree / fonts, so this
@@ -369,6 +403,50 @@ fn total_decompressed_size_is_bounded_across_streams() {
         Err(other) => panic!("expected MemoryLimitExceeded, got {other:?}"),
         Ok(_) => panic!("the total was not bounded"),
     }
+}
+
+/// A classic table that lists the object stream (object 4) under a second number too, at the
+/// same offset. Returns the file and the length of the object stream's content.
+fn pdf_listing_an_object_stream_twice() -> (Vec<u8>, usize) {
+    let pages = "<< /Type /Pages /Kids [] /Count 0 >>";
+    let content = format!("2 0 {pages}");
+    let objects = [
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+        format!(
+            "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n{content}\nendstream\nendobj\n",
+            content.len()
+        ),
+    ];
+    let mut pdf = b"%PDF-1.5\n".to_vec();
+    let mut offsets = Vec::new();
+    for object in &objects {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(object.as_bytes());
+    }
+    let xref = pdf.len();
+    // Object 2 lives in the object stream, which the table does not say; objects 4 and 5 both
+    // point at the stream.
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 2\n0000000000 65535 f \n{:010} 00000 n \n4 2\n{:010} 00000 n \n{:010} 00000 n \ntrailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets[0], offsets[1], offsets[1]
+        )
+        .as_bytes(),
+    );
+    (pdf, content.len())
+}
+
+/// An object stream that two table entries point at is unpacked once, and counted toward the
+/// total once.
+#[test]
+fn an_object_stream_listed_twice_counts_toward_the_total_once() {
+    let (pdf, decoded) = pdf_listing_an_object_stream_twice();
+    let options = LoadOptions {
+        max_total_decompressed_size: Some(decoded + decoded / 2),
+        ..LoadOptions::default()
+    };
+    let doc = Document::load_mem_with_options(&pdf, options).unwrap();
+    assert!(doc.objects.contains_key(&(2, 0)));
 }
 
 /// A file whose objects all sit after an inserted line: its table reads, nothing it points

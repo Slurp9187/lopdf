@@ -128,6 +128,27 @@ fn embedded_files_are_decrypted_with_the_embedded_file_filter() {
     assert_decrypted(&doc);
 }
 
+/// Drops the catalog's `/Names`, and with it the file specification that names the attachment.
+fn drop_names(id: ObjectId, object: &mut Object) -> Option<(ObjectId, Object)> {
+    if let Object::Dictionary(dict) = object {
+        dict.remove(b"Names");
+    }
+    Some((id, object.clone()))
+}
+
+#[test]
+fn a_load_filter_does_not_change_which_filter_decrypts_an_embedded_file() {
+    let bytes = eff_document();
+    let options = LoadOptions {
+        password: Some(USER.to_string()),
+        filter: Some(drop_names),
+        ..LoadOptions::default()
+    };
+    let doc = Document::load_mem_with_options(&bytes, options).unwrap();
+    assert!(doc.catalog().unwrap().get(b"Names").is_err());
+    assert_decrypted(&doc);
+}
+
 #[test]
 fn decrypting_a_document_uses_the_embedded_file_filter_too() {
     let mut doc = encrypted_eff_document();

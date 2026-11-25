@@ -140,6 +140,7 @@ impl Permissions {
     }
 }
 
+/// `Debug` prints `***` for the passwords and the file encryption key.
 #[derive(Clone)]
 pub enum EncryptionVersion<'a> {
     /// (PDF 1.4; deprecated in PDF 2.0) Indicates the use of encryption of data using the RC4 or
@@ -207,9 +208,9 @@ pub enum EncryptionVersion<'a> {
 
 /// The state needed to encrypt or decrypt a document's objects.
 ///
-/// The file encryption key is wiped when the state (or any clone of it) is dropped, and
-/// `Debug` prints neither the key nor the password-derived `/O`, `/U`, `/OE`, `/UE` and
-/// `/Perms` values.
+/// The file encryption key is wiped when the state (or any clone of it) is dropped. `Debug`
+/// prints `***` for the key and for the password-derived `/O`, `/U`, `/OE`, `/UE` and `/Perms`
+/// values. Use [`file_encryption_key`](Self::file_encryption_key) to read the key.
 #[derive(Clone, Default)]
 pub struct EncryptionState {
     pub(crate) version: i64,
@@ -236,60 +237,33 @@ pub struct EncryptionState {
     pub(crate) encrypt_object_id: Option<ObjectId>,
 }
 
-/// Stands in for a secret in `Debug` output.
-struct Redacted;
-
-impl fmt::Debug for Redacted {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("[REDACTED]")
-    }
-}
-
-impl fmt::Debug for EncryptionState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("EncryptionState")
-            .field("version", &self.version)
-            .field("revision", &self.revision)
-            .field("key_length", &self.key_length)
-            .field("encrypt_metadata", &self.encrypt_metadata)
-            .field("crypt_filters", &self.crypt_filters)
-            .field("file_encryption_key", &Redacted)
-            .field("stream_filter", &self.stream_filter)
-            .field("string_filter", &self.string_filter)
-            .field("owner_value", &Redacted)
-            .field("owner_encrypted", &Redacted)
-            .field("user_value", &Redacted)
-            .field("user_encrypted", &Redacted)
-            .field("permissions", &self.permissions)
-            .field("permission_encrypted", &Redacted)
-            .field("encrypt_object_id", &self.encrypt_object_id)
-            .finish()
-    }
-}
-
 impl fmt::Debug for EncryptionVersion<'_> {
     #[allow(deprecated)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::V1 {
-                document, permissions, ..
+                document,
+                owner_password: _,
+                user_password: _,
+                permissions,
             } => f
                 .debug_struct("V1")
                 .field("document", document)
-                .field("owner_password", &Redacted)
-                .field("user_password", &Redacted)
+                .field("owner_password", &"***")
+                .field("user_password", &"***")
                 .field("permissions", permissions)
                 .finish(),
             Self::V2 {
                 document,
+                owner_password: _,
+                user_password: _,
                 key_length,
                 permissions,
-                ..
             } => f
                 .debug_struct("V2")
                 .field("document", document)
-                .field("owner_password", &Redacted)
-                .field("user_password", &Redacted)
+                .field("owner_password", &"***")
+                .field("user_password", &"***")
                 .field("key_length", key_length)
                 .field("permissions", permissions)
                 .finish(),
@@ -299,8 +273,9 @@ impl fmt::Debug for EncryptionVersion<'_> {
                 crypt_filters,
                 stream_filter,
                 string_filter,
+                owner_password: _,
+                user_password: _,
                 permissions,
-                ..
             } => f
                 .debug_struct("V4")
                 .field("document", document)
@@ -308,47 +283,93 @@ impl fmt::Debug for EncryptionVersion<'_> {
                 .field("crypt_filters", crypt_filters)
                 .field("stream_filter", stream_filter)
                 .field("string_filter", string_filter)
-                .field("owner_password", &Redacted)
-                .field("user_password", &Redacted)
+                .field("owner_password", &"***")
+                .field("user_password", &"***")
                 .field("permissions", permissions)
                 .finish(),
             Self::R5 {
                 encrypt_metadata,
                 crypt_filters,
+                file_encryption_key: _,
                 stream_filter,
                 string_filter,
+                owner_password: _,
+                user_password: _,
                 permissions,
-                ..
             } => f
                 .debug_struct("R5")
                 .field("encrypt_metadata", encrypt_metadata)
                 .field("crypt_filters", crypt_filters)
-                .field("file_encryption_key", &Redacted)
+                .field("file_encryption_key", &"***")
                 .field("stream_filter", stream_filter)
                 .field("string_filter", string_filter)
-                .field("owner_password", &Redacted)
-                .field("user_password", &Redacted)
+                .field("owner_password", &"***")
+                .field("user_password", &"***")
                 .field("permissions", permissions)
                 .finish(),
             Self::V5 {
                 encrypt_metadata,
                 crypt_filters,
+                file_encryption_key: _,
                 stream_filter,
                 string_filter,
+                owner_password: _,
+                user_password: _,
                 permissions,
-                ..
             } => f
                 .debug_struct("V5")
                 .field("encrypt_metadata", encrypt_metadata)
                 .field("crypt_filters", crypt_filters)
-                .field("file_encryption_key", &Redacted)
+                .field("file_encryption_key", &"***")
                 .field("stream_filter", stream_filter)
                 .field("string_filter", string_filter)
-                .field("owner_password", &Redacted)
-                .field("user_password", &Redacted)
+                .field("owner_password", &"***")
+                .field("user_password", &"***")
                 .field("permissions", permissions)
                 .finish(),
         }
+    }
+}
+
+impl fmt::Debug for EncryptionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Bind every field, so that a new one has to be printed or hidden here on purpose.
+        let Self {
+            version,
+            revision,
+            key_length,
+            encrypt_metadata,
+            crypt_filters,
+            file_encryption_key: _,
+            stream_filter,
+            string_filter,
+            embedded_file_filter,
+            owner_value: _,
+            owner_encrypted: _,
+            user_value: _,
+            user_encrypted: _,
+            permissions,
+            permission_encrypted: _,
+            encrypt_object_id,
+        } = self;
+        f.debug_struct("EncryptionState")
+            .field("version", version)
+            .field("revision", revision)
+            .field("key_length", key_length)
+            .field("encrypt_metadata", encrypt_metadata)
+            .field("crypt_filters", crypt_filters)
+            .field("file_encryption_key", &"***")
+            .field("stream_filter", stream_filter)
+            .field("string_filter", string_filter)
+            .field("embedded_file_filter", embedded_file_filter)
+            .field("owner_value", &"***")
+            .field("owner_encrypted", &"***")
+            .field("user_value", &"***")
+            .field("user_encrypted", &"***")
+            .field("permissions", permissions)
+            .field("permission_encrypted", &"***")
+            .field("encrypt_object_id", encrypt_object_id)
+            .finish()
     }
 }
 
@@ -836,7 +857,7 @@ impl EncryptionState {
                 filter.set(b"Type", Object::Name(b"CryptFilter".to_vec()));
                 filter.set(b"CFM", Object::Name(crypt_filter.method().to_vec()));
 
-                // The AESV3 key length in bytes, as other writers (qpdf, pypdf, LibreOffice) give it.
+                // The AESV3 key length in bytes, as qpdf writes it.
                 if crypt_filter.method() == b"AESV3" {
                     filter.set(b"Length", Object::Integer(32));
                 }
@@ -1145,6 +1166,111 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    /// Asserts that `debug` holds neither password nor a byte run of the key `[0xAB; 32]`, in
+    /// either the `{:?}` or the `{:#?}` layout.
+    fn assert_no_secrets(debug: &str) {
+        assert!(!debug.contains("owner-secret"), "{debug}");
+        assert!(!debug.contains("user-secret"), "{debug}");
+        let compact: String = debug.split_whitespace().collect();
+        assert!(!compact.contains("171,171,171,171"), "{debug}");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn debug_hides_the_passwords_and_the_file_encryption_key() {
+        let document = create_document();
+        let file_encryption_key = [0xABu8; 32];
+        let aes128: Arc<dyn CryptFilter> = Arc::new(Aes128CryptFilter);
+        let aes256: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
+        let versions = [
+            EncryptionVersion::V1 {
+                document: &document,
+                owner_password: "owner-secret",
+                user_password: "user-secret",
+                permissions: Permissions::all(),
+            },
+            EncryptionVersion::V2 {
+                document: &document,
+                owner_password: "owner-secret",
+                user_password: "user-secret",
+                key_length: 128,
+                permissions: Permissions::all(),
+            },
+            EncryptionVersion::V4 {
+                document: &document,
+                encrypt_metadata: true,
+                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes128)]),
+                stream_filter: b"StdCF".to_vec(),
+                string_filter: b"StdCF".to_vec(),
+                owner_password: "owner-secret",
+                user_password: "user-secret",
+                permissions: Permissions::all(),
+            },
+            EncryptionVersion::R5 {
+                encrypt_metadata: true,
+                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes256.clone())]),
+                file_encryption_key: &file_encryption_key,
+                stream_filter: b"StdCF".to_vec(),
+                string_filter: b"StdCF".to_vec(),
+                owner_password: "owner-secret",
+                user_password: "user-secret",
+                permissions: Permissions::all(),
+            },
+            EncryptionVersion::V5 {
+                encrypt_metadata: true,
+                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes256)]),
+                file_encryption_key: &file_encryption_key,
+                stream_filter: b"StdCF".to_vec(),
+                string_filter: b"StdCF".to_vec(),
+                owner_password: "owner-secret",
+                user_password: "user-secret",
+                permissions: Permissions::all(),
+            },
+        ];
+        for version in &versions {
+            let has_key = matches!(version, EncryptionVersion::R5 { .. } | EncryptionVersion::V5 { .. });
+            for debug in [format!("{version:?}"), format!("{version:#?}")] {
+                assert_no_secrets(&debug);
+                assert!(debug.contains("owner_password: \"***\""), "{debug}");
+                assert!(debug.contains("user_password: \"***\""), "{debug}");
+                assert_eq!(debug.contains("file_encryption_key: \"***\""), has_key, "{debug}");
+                assert!(debug.contains("permissions: "), "{debug}");
+            }
+        }
+
+        // The state hides the key and the password-derived /O, /U, /OE, /UE and /Perms values,
+        // which an offline password guess can be checked against.
+        let [.., v5] = versions;
+        let state = EncryptionState::try_from(v5).unwrap();
+        let owner_value = format!("{:?}", state.owner_value());
+        for debug in [format!("{state:?}"), format!("{state:#?}")] {
+            assert_no_secrets(&debug);
+            assert!(!debug.contains(&owner_value), "{debug}");
+            for field in [
+                "file_encryption_key",
+                "owner_value",
+                "owner_encrypted",
+                "user_value",
+                "user_encrypted",
+                "permission_encrypted",
+            ] {
+                assert!(debug.contains(&format!("{field}: \"***\"")), "{debug}");
+            }
+            assert!(debug.contains("revision: 6"), "{debug}");
+        }
+
+        // A decrypted document holds the state, and so prints it too.
+        let mut document = create_document();
+        document.encrypt(&state).unwrap();
+        document.decrypt("user-secret").unwrap();
+        let decrypted_state = document.encryption_state.as_ref().unwrap();
+        assert_eq!(decrypted_state.file_encryption_key(), file_encryption_key);
+        for debug in [format!("{document:?}"), format!("{document:#?}")] {
+            assert_no_secrets(&debug);
+            assert!(debug.contains("file_encryption_key: \"***\""), "{debug}");
+        }
+    }
+
     #[test]
     fn rc4_works() {
         let cases = [
@@ -1234,69 +1360,6 @@ mod tests {
             let state = EncryptionState::try_from(version).unwrap();
             assert!(document.encrypt(&state).is_ok());
             assert!(document.decrypt("user").is_ok());
-        }
-    }
-
-    /// `Debug` must not print the passwords, the file encryption key or the
-    /// password-derived values, whether through `EncryptionVersion`,
-    /// `EncryptionState` or a decrypted `Document` that holds the state.
-    #[test]
-    fn debug_redacts_keys_and_passwords() {
-        let file_encryption_key = [0xABu8; 32];
-        let key_bytes = "171, 171, 171, 171";
-        let key_hex = ["abababab", "ABABABAB"];
-        let crypt_filter: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
-        let version = EncryptionVersion::V5 {
-            encrypt_metadata: true,
-            crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), crypt_filter)]),
-            file_encryption_key: &file_encryption_key,
-            stream_filter: b"StdCF".to_vec(),
-            string_filter: b"StdCF".to_vec(),
-            owner_password: "owner-secret",
-            user_password: "user-secret",
-            permissions: Permissions::all(),
-        };
-
-        assert_eq!(
-            format!("{version:?}"),
-            "V5 { encrypt_metadata: true, \
-             crypt_filters: {[83, 116, 100, 67, 70]: Aes256CryptFilter}, \
-             file_encryption_key: [REDACTED], \
-             stream_filter: [83, 116, 100, 67, 70], \
-             string_filter: [83, 116, 100, 67, 70], \
-             owner_password: [REDACTED], user_password: [REDACTED], \
-             permissions: Permissions(PRINTABLE | MODIFIABLE | COPYABLE | ANNOTABLE | FILLABLE \
-             | COPYABLE_FOR_ACCESSIBILITY | ASSEMBLABLE | PRINTABLE_IN_HIGH_QUALITY) }"
-        );
-
-        let state = EncryptionState::try_from(version).unwrap();
-        let state_debug = format!("{state:?}");
-        for field in [
-            "file_encryption_key",
-            "owner_value",
-            "owner_encrypted",
-            "user_value",
-            "user_encrypted",
-            "permission_encrypted",
-        ] {
-            assert!(state_debug.contains(&format!("{field}: [REDACTED]")), "{state_debug}");
-        }
-
-        let mut document = create_document();
-        document.encrypt(&state).unwrap();
-        document.decrypt("user-secret").unwrap();
-        assert_eq!(
-            document.encryption_state.as_ref().unwrap().file_encryption_key(),
-            file_encryption_key
-        );
-
-        let debugs = [state_debug, format!("{:?}", state.clone()), format!("{document:?}")];
-        for debug in &debugs {
-            assert!(!debug.contains(key_bytes), "{debug}");
-            for hex in key_hex {
-                assert!(!debug.contains(hex), "{debug}");
-            }
-            assert!(!debug.contains("secret"), "{debug}");
         }
     }
 

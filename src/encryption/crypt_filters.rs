@@ -5,7 +5,6 @@ use super::stream::{AesCbcDecipher, ChunkDecipher, IdentityDecipher, Rc4Decipher
 use crate::ObjectId;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use md5::{Digest as _, Md5};
-use rand::RngExt as _;
 use zeroize::{Zeroize as _, Zeroizing};
 
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
@@ -131,10 +130,10 @@ macro_rules! aes_cbc_crypt_filter {
                 // if encryption fails; the exact capacity means it never reallocates.
                 let mut ciphertext = Zeroizing::new(Vec::with_capacity(16 + ciphertext_len));
 
-                // Generate random numbers to populate the initialization vector.
-                let mut rng = rand::rng();
+                // Populate the initialization vector from the operating system's RNG rather than a
+                // userspace generator, which would repeat its output in a forked child process.
                 let mut iv = [0u8; 16];
-                rng.fill(&mut iv);
+                getrandom::fill(&mut iv).expect("OS random number generator failed");
 
                 // Combine the IV and the plaintext.
                 ciphertext.extend_from_slice(&iv);
