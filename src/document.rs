@@ -457,8 +457,13 @@ impl Document {
         // document as it was.
         let object_id = self.try_new_object_id()?;
 
+        let embedded_files = encryption::embedded_file_ids(self.objects.values());
         for (&id, obj) in self.objects.iter_mut() {
-            encryption::encrypt_object(state, id, obj)?;
+            if embedded_files.contains(&id) {
+                encryption::encrypt_embedded_file(state, id, obj)?;
+            } else {
+                encryption::encrypt_object(state, id, obj)?;
+            }
         }
 
         self.objects.insert(object_id, Object::Dictionary(encrypted));
@@ -499,9 +504,16 @@ impl Document {
         let mut state = EncryptionState::decode(&*self, password)?;
         let mut first_error = None;
 
+        // Whether a stream is an embedded file, which /EFF decrypts, is known only once every file
+        // specification is, object streams included; streams wait for that.
+        let mut streams = vec![];
         for (&id, obj) in self.objects.iter_mut() {
             // The encryption dictionary is not encrypted, leave it alone
             if id == encryption_obj_id {
+                continue;
+            }
+            if obj.as_stream().is_ok_and(|stream| !stream.dict.has_type(b"ObjStm")) {
+                streams.push(id);
                 continue;
             }
 
@@ -534,6 +546,22 @@ impl Document {
         // Only add entries, but never replace entries
         for (id, entry) in object_streams {
             self.objects.entry(id).or_insert(entry);
+        }
+
+        let embedded_files = encryption::embedded_file_ids(self.objects.values());
+        for id in streams {
+            let Some(obj) = self.objects.get_mut(&id) else {
+                continue;
+            };
+            // As for every other object, a stream that fails to decrypt does not stop the rest.
+            let result = if embedded_files.contains(&id) {
+                encryption::decrypt_embedded_file(&state, id, obj)
+            } else {
+                encryption::decrypt_object(&state, id, obj)
+            };
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
         }
 
         let object_id = self.trailer.remove(b"Encrypt").unwrap().as_reference()?;
