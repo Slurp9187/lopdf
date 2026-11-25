@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 pub use algorithms::PasswordAlgorithm;
 
@@ -202,8 +203,11 @@ pub enum EncryptionVersion<'a> {
     },
 }
 
-/// `Debug` prints `***` for the file encryption key. Use
-/// [`file_encryption_key`](Self::file_encryption_key) to read it.
+/// The state needed to encrypt or decrypt a document's objects.
+///
+/// The file encryption key is wiped when the state (or any clone of it) is dropped. `Debug`
+/// prints `***` for the key and for the password-derived `/O`, `/U`, `/OE`, `/UE` and `/Perms`
+/// values. Use [`file_encryption_key`](Self::file_encryption_key) to read the key.
 #[derive(Clone, Default)]
 pub struct EncryptionState {
     pub(crate) version: i64,
@@ -211,7 +215,7 @@ pub struct EncryptionState {
     pub(crate) key_length: Option<usize>,
     pub(crate) encrypt_metadata: bool,
     pub(crate) crypt_filters: BTreeMap<Vec<u8>, Arc<dyn CryptFilter>>,
-    pub(crate) file_encryption_key: Vec<u8>,
+    pub(crate) file_encryption_key: Zeroizing<Vec<u8>>,
     pub(crate) stream_filter: Vec<u8>,
     pub(crate) string_filter: Vec<u8>,
     pub(crate) owner_value: Vec<u8>,
@@ -333,12 +337,12 @@ impl fmt::Debug for EncryptionState {
             file_encryption_key: _,
             stream_filter,
             string_filter,
-            owner_value,
-            owner_encrypted,
-            user_value,
-            user_encrypted,
+            owner_value: _,
+            owner_encrypted: _,
+            user_value: _,
+            user_encrypted: _,
             permissions,
-            permission_encrypted,
+            permission_encrypted: _,
             encrypt_object_id,
         } = self;
         f.debug_struct("EncryptionState")
@@ -350,12 +354,12 @@ impl fmt::Debug for EncryptionState {
             .field("file_encryption_key", &"***")
             .field("stream_filter", stream_filter)
             .field("string_filter", string_filter)
-            .field("owner_value", owner_value)
-            .field("owner_encrypted", owner_encrypted)
-            .field("user_value", user_value)
-            .field("user_encrypted", user_encrypted)
+            .field("owner_value", &"***")
+            .field("owner_encrypted", &"***")
+            .field("user_value", &"***")
+            .field("user_encrypted", &"***")
             .field("permissions", permissions)
-            .field("permission_encrypted", permission_encrypted)
+            .field("permission_encrypted", &"***")
             .field("encrypt_object_id", encrypt_object_id)
             .finish()
     }
@@ -543,8 +547,8 @@ fn r4_state(params: R4Params<'_>, crypt_filters: Option<CryptFilters>) -> Result
 
     let mut algorithm = r4_algorithm(key_length, version, revision, encrypt_metadata, permissions);
 
-    let owner_password = algorithm.sanitize_password_r4(owner_password)?;
-    let user_password = algorithm.sanitize_password_r4(user_password)?;
+    let owner_password = Zeroizing::new(algorithm.sanitize_password_r4(owner_password)?);
+    let user_password = Zeroizing::new(algorithm.sanitize_password_r4(user_password)?);
 
     algorithm.owner_value = algorithm.compute_hashed_owner_password_r4(Some(&owner_password), &user_password)?;
 
@@ -619,8 +623,8 @@ fn aes256_state(revision: i64, params: Aes256Params<'_>) -> Result<EncryptionSta
         ..Default::default()
     };
 
-    let owner_password = algorithm.sanitize_password_r6(owner_password)?;
-    let user_password = algorithm.sanitize_password_r6(user_password)?;
+    let owner_password = Zeroizing::new(algorithm.sanitize_password_r6(owner_password)?);
+    let user_password = Zeroizing::new(algorithm.sanitize_password_r6(user_password)?);
 
     let (user_value, user_encrypted) = algorithm.compute_hashed_user_password_r6(file_encryption_key, user_password)?;
 
@@ -641,7 +645,7 @@ fn aes256_state(revision: i64, params: Aes256Params<'_>) -> Result<EncryptionSta
         key_length: algorithm.length,
         encrypt_metadata: algorithm.encrypt_metadata,
         crypt_filters,
-        file_encryption_key: file_encryption_key.to_vec(),
+        file_encryption_key: Zeroizing::new(file_encryption_key.to_vec()),
         stream_filter,
         string_filter,
         owner_value: algorithm.owner_value,
@@ -676,7 +680,7 @@ impl EncryptionState {
     }
 
     pub fn file_encryption_key(&self) -> &[u8] {
-        self.file_encryption_key.as_ref()
+        self.file_encryption_key.as_slice()
     }
 
     pub fn default_stream_filter(&self) -> &[u8] {
@@ -743,7 +747,7 @@ impl EncryptionState {
         // Either password may be given, but only the user password (or, for an owner password,
         // the value Algorithm 7 recovers from `/O`) is valid input to Algorithm 2.
         // See `PasswordAlgorithm::resolve_password_for_key_derivation`.
-        let resolved_password = algorithm.resolve_password_for_key_derivation(document, password)?;
+        let resolved_password = Zeroizing::new(algorithm.resolve_password_for_key_derivation(document, password)?);
         let file_encryption_key = algorithm.compute_file_encryption_key(document, resolved_password)?;
 
         let mut crypt_filters = document.get_crypt_filters();
@@ -759,7 +763,7 @@ impl EncryptionState {
             key_length: algorithm.length,
             encrypt_metadata: algorithm.encrypt_metadata,
             crypt_filters,
-            file_encryption_key,
+            file_encryption_key: Zeroizing::new(file_encryption_key),
             owner_value: algorithm.owner_value,
             owner_encrypted: algorithm.owner_encrypted,
             user_value: algorithm.user_value,
@@ -977,7 +981,7 @@ fn is_signature_dictionary(dict: &Dictionary) -> bool {
 fn transform_bytes(
     state: &EncryptionState, obj_id: ObjectId, filter: &dyn CryptFilter, data: &[u8], direction: Direction,
 ) -> Result<Vec<u8>, DecryptionError> {
-    let key = filter.compute_key(&state.file_encryption_key, obj_id)?;
+    let key = Zeroizing::new(filter.compute_key(&state.file_encryption_key, obj_id)?);
 
     match direction {
         Direction::Encrypt => filter.encrypt(&key, data),
@@ -1088,16 +1092,26 @@ mod tests {
             }
         }
 
-        // The state hides the key, but still prints /O and /U, which the file holds anyway.
+        // The state hides the key and the password-derived /O, /U, /OE, /UE and /Perms values,
+        // which an offline password guess can be checked against.
         let [.., v5] = versions;
         let state = EncryptionState::try_from(v5).unwrap();
-        let owner_value = format!("owner_value: {:?}", state.owner_value());
+        let owner_value = format!("{:?}", state.owner_value());
         for debug in [format!("{state:?}"), format!("{state:#?}")] {
             assert_no_secrets(&debug);
-            assert!(debug.contains("file_encryption_key: \"***\""), "{debug}");
+            assert!(!debug.contains(&owner_value), "{debug}");
+            for field in [
+                "file_encryption_key",
+                "owner_value",
+                "owner_encrypted",
+                "user_value",
+                "user_encrypted",
+                "permission_encrypted",
+            ] {
+                assert!(debug.contains(&format!("{field}: \"***\"")), "{debug}");
+            }
             assert!(debug.contains("revision: 6"), "{debug}");
         }
-        assert!(format!("{state:?}").contains(&owner_value));
 
         // A decrypted document holds the state, and so prints it too.
         let mut document = create_document();
