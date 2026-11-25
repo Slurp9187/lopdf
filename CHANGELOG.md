@@ -2,6 +2,7 @@
 <a name="unreleased"></a>
 ## [Unreleased](https://github.com/J-F-Liu/lopdf/compare/v0.45.0...HEAD)
 * Add `Document::save_encrypted`, which encrypts while it writes, so an encrypted document can keep object streams: each object stream is packed from plaintext and encrypted as a whole. `encrypt` followed by a save still writes every object on its own. A signature dictionary is kept out of object streams, so its `/Contents` stays unencrypted
+* Decrypt embedded file streams with the `/EFF` crypt filter, which was ignored: an embedded file is a stream a file specification's `/EF` names, or one with `/Type /EmbeddedFile`, and a stream's own `/Crypt` filter still wins
 
 <a name="v0.45.0"></a>
 ## [v0.45.0](https://github.com/J-F-Liu/lopdf/compare/v0.44.0...v0.45.0) (2026-09-08)

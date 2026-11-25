@@ -514,7 +514,16 @@ impl IncrementalDocument {
         // would make the appended region look like the start of another document.
 
         // Encrypt a clone of each object, leaving the in-memory ones as plaintext so repeated
-        // saves do not double-encrypt.
+        // saves do not double-encrypt. An embedded file, which a file specification in either
+        // revision names, is encrypted with /EFF, as a reader decrypts it.
+        let embedded_files = encryption_state.as_ref().map(|_| {
+            encryption::embedded_file_ids(
+                self.new_document
+                    .objects
+                    .values()
+                    .chain(self.get_prev_documents().objects.values()),
+            )
+        });
         for (&(id, generation), object) in &self.new_document.objects {
             // `Self` is an `IncrementalDocument` here; the helper belongs to `Document`.
             if Document::is_regenerated_on_save(object) {
@@ -522,7 +531,15 @@ impl IncrementalDocument {
             }
             if let Some(state) = encryption_state.as_ref() {
                 let mut encrypted = object.clone();
-                encryption::encrypt_object(state, (id, generation), &mut encrypted).map_err(std::io::Error::other)?;
+                let result = if embedded_files
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(&(id, generation)))
+                {
+                    encryption::encrypt_embedded_file(state, (id, generation), &mut encrypted)
+                } else {
+                    encryption::encrypt_object(state, (id, generation), &mut encrypted)
+                };
+                result.map_err(std::io::Error::other)?;
                 Writer::write_indirect_object(&mut target, id, generation, &encrypted, &mut xref, Style::default())?;
             } else {
                 Writer::write_indirect_object(&mut target, id, generation, object, &mut xref, Style::default())?;
