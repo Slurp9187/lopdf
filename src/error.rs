@@ -176,4 +176,8 @@ pub enum XrefError {
     /// The trailer's "XRefStm" field was invalid.
     #[error("invalid start value of XRefStm")]
     StreamStart,
+    /// The cross-reference sections list more entries than
+    /// [`crate::LoadOptions::max_xref_entries`] allows.
+    #[error("cross-reference sections list more than {limit} entries")]
+    TooManyEntries { limit: usize },
 }
