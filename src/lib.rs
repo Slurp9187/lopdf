@@ -5,6 +5,7 @@
 pub mod content;
 pub mod encryption;
 pub mod filters;
+pub mod strip;
 pub mod xobject;
 pub mod xref;
 

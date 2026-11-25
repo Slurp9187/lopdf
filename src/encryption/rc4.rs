@@ -52,6 +52,16 @@ impl Rc4 {
         state.zeroize();
     }
 
+    /// A keystream that carries on from where the last call to
+    /// [`Rc4Keystream::apply`] stopped, for data that arrives in chunks.
+    pub fn keystream(&self) -> Rc4Keystream {
+        Rc4Keystream {
+            state: self.initial_state,
+            i: 0,
+            j: 0,
+        }
+    }
+
     /// Allocates a new Vec<u8> of the same length as `input` and decrypts
     ///  `input` into it.
     pub fn decrypt<Input>(&self, input: Input) -> Vec<u8>
@@ -72,5 +82,35 @@ impl Rc4 {
     {
         // Rc4 is symmetric
         self.decrypt(input)
+    }
+}
+
+/// An RC4 keystream part way through, from [`Rc4::keystream`]. Its state is as
+/// good as the key, so it is wiped on drop.
+pub struct Rc4Keystream {
+    state: [u8; 256],
+    i: u8,
+    j: u8,
+}
+
+impl Drop for Rc4Keystream {
+    fn drop(&mut self) {
+        self.state.zeroize();
+        self.i.zeroize();
+        self.j.zeroize();
+    }
+}
+
+impl Rc4Keystream {
+    /// XORs the next `input.len()` bytes of the keystream with `input` into
+    /// `output`, which must be at least as long.
+    pub fn apply(&mut self, input: &[u8], output: &mut [u8]) {
+        for (i_byte, o_byte) in input.iter().zip(output.iter_mut()) {
+            self.i = self.i.wrapping_add(1);
+            self.j = self.j.wrapping_add(self.state[self.i as usize]);
+            self.state.swap(self.i as usize, self.j as usize);
+            let key_byte = self.state[(self.state[self.i as usize].wrapping_add(self.state[self.j as usize])) as usize];
+            *o_byte = i_byte ^ key_byte;
+        }
     }
 }
