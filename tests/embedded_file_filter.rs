@@ -201,6 +201,31 @@ fn encrypting_again_keeps_the_embedded_file_filter() {
     assert_decrypted(&doc);
 }
 
+/// A file specification in a stream's dictionary names an embedded file too, both when the file
+/// is encrypted and when it is loaded again.
+#[test]
+fn a_file_specification_in_a_stream_dictionary_names_an_embedded_file() {
+    const HIDDEN: &[u8] = b"an attachment named from a stream's dictionary";
+    let mut doc = Document::load_mem_with_options(&eff_document(), LoadOptions::with_password(USER)).unwrap();
+    let state = doc.encryption_state.take().unwrap();
+    let hidden = doc.add_object(Stream::new(dictionary! {}, HIDDEN.to_vec()));
+    doc.add_object(Stream::new(
+        dictionary! {
+            "F" => dictionary! {
+                "Type" => "Filespec",
+                "F" => Object::string_literal("hidden.txt"),
+                "EF" => dictionary! { "F" => hidden },
+            },
+        },
+        b"data".to_vec(),
+    ));
+    let mut bytes = Vec::new();
+    doc.encrypt(&state).unwrap();
+    doc.save_to(&mut bytes).unwrap();
+    let doc = Document::load_mem_with_options(&bytes, LoadOptions::with_password(USER)).unwrap();
+    assert_eq!(doc.get_object(hidden).unwrap().as_stream().unwrap().content, HIDDEN);
+}
+
 #[test]
 fn the_embedded_file_filter_fixture_decrypts() {
     // The same shape as `eff_document`, committed so that other projects can test against these

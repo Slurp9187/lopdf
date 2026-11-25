@@ -1009,6 +1009,11 @@ impl<'a> Reader<'a> {
                 }
             }
 
+            // A file specification can also sit in a stream's dictionary, as `Document::encrypt`
+            // finds it there.
+            for (_, _, obj) in &streams {
+                embedded_files.extend(encryption::embedded_file_ids([obj]));
+            }
             for (obj_id, id, mut obj) in streams {
                 let result = if embedded_files.contains(&obj_id) {
                     encryption::decrypt_embedded_file(state, obj_id, &mut obj)
