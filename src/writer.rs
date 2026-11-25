@@ -89,7 +89,7 @@ impl Document {
             id: self.try_new_object_id()?,
             // Only the document's own streams: an /EF that names another number, say one an object
             // stream generated here takes, must not change how that is encrypted.
-            embedded_files: encryption::embedded_file_ids(self.objects.values())
+            embedded_files: encryption::embedded_file_ids_in(&self.objects)
                 .into_iter()
                 .filter(|id| self.objects.get(id).is_some_and(|object| object.as_stream().is_ok()))
                 .collect(),
@@ -531,12 +531,14 @@ impl IncrementalDocument {
         // saves do not double-encrypt. An embedded file, which a file specification in either
         // revision names, is encrypted with /EFF, as a reader decrypts it.
         let embedded_files = encryption_state.as_ref().map(|_| {
-            encryption::embedded_file_ids(
-                self.new_document
-                    .objects
-                    .values()
-                    .chain(self.get_prev_documents().objects.values()),
-            )
+            let (new, prev) = (&self.new_document.objects, &self.get_prev_documents().objects);
+            let mut ids = encryption::embedded_file_ids(new.values().chain(prev.values()));
+            encryption::resolve_indirect_ef_dictionaries(&mut ids, |id| {
+                new.get(id)
+                    .or_else(|| prev.get(id))
+                    .and_then(|object| object.as_dict().ok())
+            });
+            ids
         });
         for (&(id, generation), object) in &self.new_document.objects {
             // `Self` is an `IncrementalDocument` here; the helper belongs to `Document`.

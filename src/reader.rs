@@ -359,6 +359,9 @@ pub struct Reader<'a> {
     pub max_total_decompressed_size: Option<usize>,
     /// What the streams decoded so far came to. Atomic: objects load in parallel.
     decompressed_total: AtomicUsize,
+    /// Held while an object stream decodes under a total limit, so that streams decoding in
+    /// parallel cannot each claim what is left of the total and together pass it.
+    total_decode: Mutex<()>,
     /// Rebuild the cross-reference table by scanning before reading it as written. See
     /// [`LoadOptions::force_reconstruct`].
     pub force_reconstruct: bool,
@@ -553,6 +556,7 @@ impl<'a> Reader<'a> {
             max_decompressed_size: options.max_decompressed_size,
             max_total_decompressed_size: options.max_total_decompressed_size,
             decompressed_total: AtomicUsize::new(0),
+            total_decode: Mutex::new(()),
             force_reconstruct: options.force_reconstruct,
             max_xref_entries: options.max_xref_entries,
             normal_offsets: Vec::new(),
@@ -863,8 +867,9 @@ impl<'a> Reader<'a> {
             Ok(resolved) => Ok(resolved),
             // The scan already found nothing usable.
             Err(err) if self.force_reconstruct => Err(err),
-            // A resource limit, not damage: rebuilding by scanning would not honour it.
+            // Resource limits, not damage: rebuilding by scanning would not honour them.
             Err(err @ Error::Xref(XrefError::TooManyEntries { .. })) => Err(err),
+            Err(err) if is_decompression_limit(&err) => Err(err),
             Err(err) => match self.reconstruct_xref_and_trailer()? {
                 Some(reconstructed) => {
                     self.check_xref_entries(&reconstructed.0)?;
@@ -973,6 +978,8 @@ impl<'a> Reader<'a> {
             // Taken from the objects before the load filter sees them, so that a filter cannot
             // change which crypt filter decrypts a stream.
             let mut embedded_files = std::collections::HashSet::new();
+            // Dictionaries an indirect `/EF` may refer to, as they were before the load filter.
+            let mut ef_dictionaries = std::collections::HashMap::new();
             for (obj_id, raw_bytes) in raw_objects {
                 if let Some(enc_ref) = encrypt_ref
                     && obj_id == enc_ref
@@ -992,6 +999,11 @@ impl<'a> Reader<'a> {
                     // ciphertext in a document that no longer says it is encrypted.
                     encryption::decrypt_object(state, obj_id, &mut obj)?;
                     embedded_files.extend(encryption::embedded_file_ids([&obj]));
+                    if let Ok(dict) = obj.as_dict()
+                        && encryption::has_ef_dictionary_keys(dict)
+                    {
+                        ef_dictionaries.insert(obj_id, dict.clone());
+                    }
 
                     // Apply the load filter to the decrypted object, as `load_objects_raw` does.
                     if let Some(filter_func) = filter_func
@@ -1023,6 +1035,11 @@ impl<'a> Reader<'a> {
                                 let obj_id = (obj_num, 0);
                                 if let Some(obj) = object_stream.objects.get(&obj_id) {
                                     embedded_files.extend(encryption::embedded_file_ids([obj]));
+                                    if let Ok(dict) = obj.as_dict()
+                                        && encryption::has_ef_dictionary_keys(dict)
+                                    {
+                                        ef_dictionaries.insert(obj_id, dict.clone());
+                                    }
                                     let mut obj = obj.clone();
                                     if let Some(filter_func) = filter_func {
                                         // Object-stream members keep what the filter returns, as
@@ -1054,6 +1071,7 @@ impl<'a> Reader<'a> {
             for (_, _, obj) in &streams {
                 embedded_files.extend(encryption::embedded_file_ids([obj]));
             }
+            encryption::resolve_indirect_ef_dictionaries(&mut embedded_files, |id| ef_dictionaries.get(id));
             for (obj_id, id, mut obj) in streams {
                 if embedded_files.contains(&obj_id) {
                     encryption::decrypt_embedded_file(state, obj_id, &mut obj)?;
@@ -1555,16 +1573,20 @@ impl<'a> Reader<'a> {
     /// points at shifted objects, and failing lets reconstruction find them.
     fn xref_and_trailer_at(&mut self, offset: usize) -> Result<(usize, Xref, Dictionary)> {
         let corrected = self.correct_xref_offset(offset);
-        if corrected != offset
-            && let Ok((xref, trailer)) = parser::xref_and_trailer(&self.buffer[corrected..], self)
-            && self.locates_objects(&xref)
-        {
-            warn!(
-                "Cross-reference offset {} does not point at an xref section; using nearby offset {} instead.",
-                offset, corrected
-            );
-            self.document.xref_recovery = Some(XrefRecovery::OffsetCorrected);
-            return Ok((corrected, xref, trailer));
+        if corrected != offset {
+            match parser::xref_and_trailer(&self.buffer[corrected..], self) {
+                // A decompression limit is never skipped, here either.
+                Err(e) if is_decompression_limit(&e) => return Err(e),
+                Ok((xref, trailer)) if self.locates_objects(&xref) => {
+                    warn!(
+                        "Cross-reference offset {} does not point at an xref section; using nearby offset {} instead.",
+                        offset, corrected
+                    );
+                    self.document.xref_recovery = Some(XrefRecovery::OffsetCorrected);
+                    return Ok((corrected, xref, trailer));
+                }
+                _ => {}
+            }
         }
         let (xref, trailer) = parser::xref_and_trailer(&self.buffer[offset..], self)?;
         Ok((offset, xref, trailer))
@@ -1665,6 +1687,10 @@ impl<'a> Reader<'a> {
                 xref.merge_hybrid(stream_xref);
                 Ok(false)
             }
+            // Resource limits are never skipped, here either: the stream is not ignored as
+            // unreadable.
+            Err(e) if is_decompression_limit(&e) => Err(e),
+            Err(e @ Error::Xref(XrefError::TooManyEntries { .. })) => Err(e),
             // The table alone still describes a hybrid-reference file for older readers.
             Err(e) if !self.strict => {
                 warn!("ignoring unreadable cross-reference stream at {start}: {e}");
@@ -1706,10 +1732,11 @@ impl<'a> Reader<'a> {
                 let mut over_limit = None;
                 let found = self.find_latest_xref_stream(&markers, &mut xref, &mut over_limit);
                 match (found, over_limit) {
-                    (Some(trailer), _) => trailer,
                     // A cross-reference stream that the decompression limit kept from decoding
-                    // is there; the load fails with the limit rather than go on without it.
-                    (None, Some(limit)) => return Err(limit),
+                    // is there; the load fails with the limit rather than go on without it,
+                    // even when another stream decoded.
+                    (_, Some(limit)) => return Err(limit),
+                    (Some(trailer), None) => trailer,
                     (None, None) => match self.find_latest_catalog(&markers, &xref) {
                         Some(trailer) => trailer,
                         None => return Ok(None),
@@ -1996,9 +2023,10 @@ impl<'a> Reader<'a> {
             }
             // Counted toward the total like the streams resolution decodes.
             let limit = self.stream_limit();
-            let decoded = crate::parser_aux::decode_xref_stream_counted(stream, limit, |decoded| {
-                self.charge_decompressed(decoded)
-            });
+            let decoded =
+                crate::parser_aux::decode_xref_stream_counted(stream, limit, self.max_xref_entries, |decoded| {
+                    self.charge_decompressed(decoded)
+                });
             let (stream_xref, dictionary) = match decoded {
                 Ok(decoded) => decoded,
                 Err(e @ Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
@@ -3282,6 +3310,13 @@ impl Reader<'_> {
     /// Decode an object stream under [`Self::stream_limit`], counting it toward
     /// the total.
     fn decode_object_stream(&self, stream: &crate::Stream) -> Result<ObjectStream> {
+        // Under a total, one stream decodes at a time: what is left is read, used and charged
+        // before the next stream reads it. A poisoned lock still serializes.
+        let _turn = self.max_total_decompressed_size.map(|_| {
+            self.total_decode
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
         let limit = self.stream_limit();
         let (object_stream, decoded) =
             ObjectStream::decode_with_limit(stream, limit).map_err(|e| self.total_limit_error(limit, e))?;
