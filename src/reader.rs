@@ -26,7 +26,7 @@ use crate::linearization::Linearization;
 use crate::load_options::{FilterFunc, LoadOptions};
 use crate::object_stream::ObjectStream;
 use crate::parser;
-use crate::xref::{Xref, XrefEntry, XrefRecovery, XrefType, decode_xref_stream_with_limit};
+use crate::xref::{Xref, XrefEntry, XrefRecovery, XrefType};
 use crate::{Dictionary, Document, Error, IncrementalDocument, Object, ObjectId, Result};
 
 /// Open `path` and report its size, so the caller can pre-size the buffer it
@@ -1923,7 +1923,12 @@ impl<'a> Reader<'a> {
             if !stream.dict.has_type(b"XRef") {
                 continue;
             }
-            let (stream_xref, dictionary) = match decode_xref_stream_with_limit(stream, self.max_decompressed_size) {
+            // Counted toward the total like the streams resolution decodes.
+            let limit = self.stream_limit();
+            let decoded = crate::parser_aux::decode_xref_stream_counted(stream, limit, |decoded| {
+                self.charge_decompressed(decoded)
+            });
+            let (stream_xref, dictionary) = match decoded {
                 Ok(decoded) => decoded,
                 Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
                     *over_limit = true;
