@@ -1051,8 +1051,6 @@ pub fn decrypt_object(state: &EncryptionState, obj_id: ObjectId, obj: &mut Objec
     transform_object(state, obj_id, obj, Direction::Decrypt)
 }
 
-/// Decrypts `obj`, an embedded file stream that a file specification's `/EF` names, with `/EFF`.
-/// [`decrypt_object`] recognizes an embedded file only by its optional `/Type /EmbeddedFile`.
 /// [`encrypt_object`] for an object the caller knows is an embedded file stream, which a file
 /// specification's `/EF` names: it is encrypted with `/EFF` whether or not it says
 /// `/Type /EmbeddedFile`.
@@ -1062,6 +1060,8 @@ pub fn encrypt_embedded_file(
     transform_object(state, obj_id, obj, Direction::EncryptEmbeddedFile)
 }
 
+/// Decrypts `obj`, an embedded file stream that a file specification's `/EF` names, with `/EFF`.
+/// [`decrypt_object`] recognizes an embedded file only by its optional `/Type /EmbeddedFile`.
 pub fn decrypt_embedded_file(
     state: &EncryptionState, obj_id: ObjectId, obj: &mut Object,
 ) -> Result<(), DecryptionError> {
