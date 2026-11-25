@@ -479,7 +479,10 @@ fn a_scanned_cross_reference_stream_counts_toward_the_total() {
         max_total_decompressed_size: Some(1),
         ..LoadOptions::default()
     };
-    assert!(Document::load_mem_with_options(&pdf, options).is_err());
+    match Document::load_mem_with_options(&pdf, options) {
+        Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => assert_eq!(limit, 1),
+        other => panic!("expected MemoryLimitExceeded, got {other:?}"),
+    }
 }
 
 /// A file whose objects all sit after an inserted line: its table reads, nothing it points
