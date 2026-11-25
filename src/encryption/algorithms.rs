@@ -219,12 +219,12 @@ impl std::fmt::Debug for PasswordAlgorithm {
             .field("length", &self.length)
             .field("version", &self.version)
             .field("revision", &self.revision)
-            .field("owner_value", &"[REDACTED]")
-            .field("owner_encrypted", &"[REDACTED]")
-            .field("user_value", &"[REDACTED]")
-            .field("user_encrypted", &"[REDACTED]")
+            .field("owner_value", &"***")
+            .field("owner_encrypted", &"***")
+            .field("user_value", &"***")
+            .field("user_encrypted", &"***")
             .field("permissions", &self.permissions)
-            .field("permission_encrypted", &"[REDACTED]")
+            .field("permission_encrypted", &"***")
             .finish()
     }
 }

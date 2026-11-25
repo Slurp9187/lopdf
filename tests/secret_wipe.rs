@@ -201,10 +201,7 @@ fn the_password_algorithms_debug_hides_the_password_values() {
         "user_encrypted",
         "permission_encrypted",
     ] {
-        assert!(
-            debug.contains(&format!("{key}: \"[REDACTED]\"")),
-            "{key} is shown: {debug}"
-        );
+        assert!(debug.contains(&format!("{key}: \"***\"")), "{key} is shown: {debug}");
     }
 }
 
