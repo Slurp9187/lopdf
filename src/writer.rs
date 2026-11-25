@@ -87,7 +87,12 @@ impl Document {
             state,
             dictionary: state.encode()?,
             id: self.try_new_object_id()?,
-            embedded_files: encryption::embedded_file_ids(self.objects.values()),
+            // Only the document's own streams: an /EF that names another number, say one an object
+            // stream generated here takes, must not change how that is encrypted.
+            embedded_files: encryption::embedded_file_ids(self.objects.values())
+                .into_iter()
+                .filter(|id| self.objects.get(id).is_some_and(|object| object.as_stream().is_ok()))
+                .collect(),
         };
         self.select_xref_type(&options);
         // The trailer names `/Encrypt` only while writing, so the document stays unencrypted.
