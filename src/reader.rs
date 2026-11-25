@@ -828,6 +828,8 @@ impl<'a> Reader<'a> {
         if self.force_reconstruct
             && let Some(reconstructed) = self.reconstruct_xref_and_trailer()
         {
+            // The rebuilt table is held to the same entry limit as one read as written.
+            self.check_xref_entries(&reconstructed.0)?;
             warn!("rebuilt the cross-reference table by scanning for indirect objects, as requested");
             return Ok(reconstructed);
         }
@@ -839,6 +841,7 @@ impl<'a> Reader<'a> {
             Err(err @ Error::Xref(XrefError::TooManyEntries { .. })) => Err(err),
             Err(err) => match self.reconstruct_xref_and_trailer() {
                 Some(reconstructed) => {
+                    self.check_xref_entries(&reconstructed.0)?;
                     warn!("cross-reference resolution failed ({err}); recovered by scanning for indirect objects");
                     Ok(reconstructed)
                 }
@@ -2226,6 +2229,49 @@ fn shared_offset_document(rows: usize) -> Vec<u8> {
         .bytes(),
     );
     out
+}
+
+/// `objects` numbered objects after the catalog and the page tree, and a `startxref` that points
+/// at nothing, so a load can only rebuild the table by scanning.
+#[cfg(test)]
+fn document_needing_a_scan(objects: usize) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    out.extend(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    out.extend(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    for number in 3..objects + 3 {
+        out.extend(format!("{number} 0 obj\nnull\nendobj\n").bytes());
+    }
+    out.extend(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n9\n%%EOF\n",
+            objects + 3
+        )
+        .bytes(),
+    );
+    out
+}
+
+#[test]
+fn a_table_rebuilt_by_scanning_is_held_to_the_entry_limit() {
+    let bytes = document_needing_a_scan(1000);
+    for force_reconstruct in [false, true] {
+        let options = |max_xref_entries| LoadOptions {
+            max_xref_entries,
+            force_reconstruct,
+            ..Default::default()
+        };
+        let refused = Document::load_mem_with_options(&bytes, options(Some(500)));
+        assert!(
+            matches!(refused, Err(Error::Xref(XrefError::TooManyEntries { limit: 500 }))),
+            "{force_reconstruct}: {refused:?}"
+        );
+        let doc = Document::load_mem_with_options(&bytes, options(Some(5000))).unwrap();
+        assert_eq!(
+            doc.xref_recovery,
+            Some(XrefRecovery::Reconstructed),
+            "{force_reconstruct}"
+        );
+    }
 }
 
 #[test]
