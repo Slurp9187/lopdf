@@ -87,6 +87,7 @@ impl Document {
             state,
             dictionary: state.encode()?,
             id: self.try_new_object_id()?,
+            embedded_files: encryption::embedded_file_ids(self.objects.values()),
         };
         self.select_xref_type(&options);
         // The trailer names `/Encrypt` only while writing, so the document stays unencrypted.
@@ -398,6 +399,8 @@ struct Encrypt<'a> {
     state: &'a EncryptionState,
     dictionary: Dictionary,
     id: ObjectId,
+    /// The streams a file specification's `/EF` names, which `/EFF` encrypts.
+    embedded_files: std::collections::HashSet<ObjectId>,
 }
 
 impl Encrypt<'_> {
@@ -425,7 +428,13 @@ fn write_maybe_encrypted<W: Write>(
     match encrypt {
         Some(encrypt) => {
             let mut object = object.clone();
-            encryption::encrypt_object(encrypt.state, id, &mut object).map_err(std::io::Error::other)?;
+            // An embedded file, which a file specification's /EF names, is encrypted with /EFF.
+            let result = if encrypt.embedded_files.contains(&id) {
+                encryption::encrypt_embedded_file(encrypt.state, id, &mut object)
+            } else {
+                encryption::encrypt_object(encrypt.state, id, &mut object)
+            };
+            result.map_err(std::io::Error::other)?;
             Writer::write_indirect_object(target, id.0, id.1, &object, xref, style)
         }
         None => Writer::write_indirect_object(target, id.0, id.1, object, xref, style),
