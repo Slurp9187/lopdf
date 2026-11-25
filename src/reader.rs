@@ -932,6 +932,8 @@ impl<'a> Reader<'a> {
             // Taken from the objects before the load filter sees them, so that a filter cannot
             // change which crypt filter decrypts a stream.
             let mut embedded_files = std::collections::HashSet::new();
+            // Dictionaries an indirect `/EF` may refer to, as they were before the load filter.
+            let mut ef_dictionaries = std::collections::HashMap::new();
             for (obj_id, raw_bytes) in raw_objects {
                 if let Some(enc_ref) = encrypt_ref
                     && obj_id == enc_ref
@@ -952,6 +954,11 @@ impl<'a> Reader<'a> {
                         log::warn!("object {obj_id:?} could not be fully decrypted: {error}");
                     }
                     embedded_files.extend(encryption::embedded_file_ids([&obj]));
+                    if let Ok(dict) = obj.as_dict()
+                        && encryption::has_ef_dictionary_keys(dict)
+                    {
+                        ef_dictionaries.insert(obj_id, dict.clone());
+                    }
 
                     // Apply the load filter to the decrypted object, as `load_objects_raw` does.
                     if let Some(filter_func) = filter_func
@@ -983,6 +990,11 @@ impl<'a> Reader<'a> {
                                 let obj_id = (obj_num, 0);
                                 if let Some(obj) = object_stream.objects.get(&obj_id) {
                                     embedded_files.extend(encryption::embedded_file_ids([obj]));
+                                    if let Ok(dict) = obj.as_dict()
+                                        && encryption::has_ef_dictionary_keys(dict)
+                                    {
+                                        ef_dictionaries.insert(obj_id, dict.clone());
+                                    }
                                     let mut obj = obj.clone();
                                     if let Some(filter_func) = filter_func {
                                         // Object-stream members keep what the filter returns, as
@@ -1014,6 +1026,7 @@ impl<'a> Reader<'a> {
             for (_, _, obj) in &streams {
                 embedded_files.extend(encryption::embedded_file_ids([obj]));
             }
+            encryption::resolve_indirect_ef_dictionaries(&mut embedded_files, |id| ef_dictionaries.get(id));
             for (obj_id, id, mut obj) in streams {
                 let result = if embedded_files.contains(&obj_id) {
                     encryption::decrypt_embedded_file(state, obj_id, &mut obj)
