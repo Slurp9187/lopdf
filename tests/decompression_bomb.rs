@@ -551,3 +551,75 @@ fn the_total_bounds_a_rebuilt_load() {
         Ok(_) => panic!("the rebuilt load was not bounded by the total"),
     }
 }
+
+/// A classic-table file whose trailer names, with `/XRefStm`, a cross-reference stream that is
+/// a bomb: a hybrid-reference file.
+fn hybrid_pdf_with_xref_stream_bomb(bomb: &[u8]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.5\n".to_vec();
+    let mut offsets = Vec::new();
+    for (number, body) in [
+        (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+        (2, "<< /Type /Pages /Kids [] /Count 0 >>"),
+    ] {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let stream_start = pdf.len();
+    offsets.push(stream_start);
+    pdf.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /XRef /Size 4 /W [1 1 1] /Filter /FlateDecode /Length {} >>\nstream\n",
+            bomb.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(bomb);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    let startxref = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R /XRefStm {stream_start} >>\nstartxref\n{startxref}\n%%EOF\n")
+            .as_bytes(),
+    );
+    pdf
+}
+
+/// The stream a hybrid-reference file names is decoded like any other, and a decompression
+/// limit it reaches fails a lenient load rather than being ignored as an unreadable stream.
+/// Measured before the fix: the load succeeded.
+#[test]
+fn a_hybrid_cross_reference_stream_over_the_limit_fails_the_load() {
+    let pdf = hybrid_pdf_with_xref_stream_bomb(&flate_bomb(64 * MIB));
+    match Document::load_mem_with_options(&pdf, LoadOptions::with_max_decompressed_size(4 * MIB)) {
+        Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => assert_eq!(limit, 4 * MIB),
+        Err(other) => panic!("expected MemoryLimitExceeded, got {other:?}"),
+        Ok(_) => panic!("the hybrid cross-reference stream bomb was ignored"),
+    }
+}
+
+/// When the table is rebuilt by scanning, a cross-reference stream over the limit fails the
+/// load even though another one decodes. Measured before the fix: the load succeeded.
+#[test]
+fn a_scanned_cross_reference_stream_over_the_limit_fails_the_load_beside_a_good_one() {
+    let mut pdf = xref_stream_pdf_needing_a_scan();
+    let startxref = pdf.windows(9).rposition(|window| window == b"startxref").unwrap();
+    let bomb = flate_bomb(64 * MIB);
+    let mut object = format!(
+        "90 0 obj\n<< /Type /XRef /Size 91 /W [1 1 1] /Filter /FlateDecode /Length {} >>\nstream\n",
+        bomb.len()
+    )
+    .into_bytes();
+    object.extend_from_slice(&bomb);
+    object.extend_from_slice(b"\nendstream\nendobj\n");
+    pdf.splice(startxref..startxref, object);
+
+    let options = LoadOptions::with_max_decompressed_size(4 * MIB);
+    match Document::load_mem_with_options(&pdf, options) {
+        Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => assert_eq!(limit, 4 * MIB),
+        Err(other) => panic!("expected MemoryLimitExceeded, got {other:?}"),
+        Ok(_) => panic!("the scanned cross-reference stream bomb was ignored"),
+    }
+}
