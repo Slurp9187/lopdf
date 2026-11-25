@@ -89,7 +89,7 @@ impl Document {
             id: self.try_new_object_id()?,
             // Only the document's own streams: an /EF that names another number, say one an object
             // stream generated here takes, must not change how that is encrypted.
-            embedded_files: encryption::embedded_file_ids(self.objects.values())
+            embedded_files: encryption::embedded_file_ids_in(&self.objects)
                 .into_iter()
                 .filter(|id| self.objects.get(id).is_some_and(|object| object.as_stream().is_ok()))
                 .collect(),
