@@ -8,7 +8,7 @@ pub struct Pkcs5;
 
 impl Pkcs5 {
     #[inline]
-    fn unpad(block: &[u8], strict: bool) -> Result<&[u8], PaddingError> {
+    pub(super) fn unpad(block: &[u8], strict: bool) -> Result<&[u8], PaddingError> {
         // TODO: use bounds to check it at compile time
         if block.len() > 16 {
             panic!("block size is too big for PKCS#5");
