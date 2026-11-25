@@ -68,6 +68,14 @@ pub struct LoadOptions {
     ///
     /// [`Document::xref_recovery`]: crate::Document::xref_recovery
     pub force_reconstruct: bool,
+    /// Most cross-reference entries kept across all of a file's sections (its
+    /// `/Prev` chain and any `/XRefStm`). A small file can list millions of
+    /// entries, since a compressed cross-reference row is a few bytes, and every
+    /// entry is kept in memory. A file over it fails with
+    /// [`crate::XrefError::TooManyEntries`] and is not rebuilt by scanning.
+    ///
+    /// Defaults to `None`, no limit.
+    pub max_xref_entries: Option<usize>,
 }
 
 impl Default for LoadOptions {
@@ -78,6 +86,7 @@ impl Default for LoadOptions {
             strict: false,
             max_decompressed_size: Some(DEFAULT_MAX_DECOMPRESSED_SIZE),
             force_reconstruct: false,
+            max_xref_entries: None,
         }
     }
 }
@@ -90,6 +99,7 @@ impl std::fmt::Debug for LoadOptions {
             .field("strict", &self.strict)
             .field("max_decompressed_size", &self.max_decompressed_size)
             .field("force_reconstruct", &self.force_reconstruct)
+            .field("max_xref_entries", &self.max_xref_entries)
             .finish()
     }
 }
