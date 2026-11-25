@@ -201,6 +201,41 @@ fn encrypting_again_keeps_the_embedded_file_filter() {
     assert_decrypted(&doc);
 }
 
+/// `save_encrypted`, with object streams or without, encrypts every embedded file with `/EFF` too.
+#[test]
+fn saving_encrypted_keeps_the_embedded_file_filter() {
+    let mut doc = Document::load_mem_with_options(&eff_document(), LoadOptions::with_password(USER)).unwrap();
+    let state = doc.encryption_state.take().unwrap();
+    for use_object_streams in [false, true] {
+        let options = lopdf::SaveOptions::builder()
+            .use_object_streams(use_object_streams)
+            .build();
+        let mut bytes = Vec::new();
+        doc.save_encrypted(&mut bytes, &state, options).unwrap();
+        let reloaded = Document::load_mem_with_options(&bytes, LoadOptions::with_password(USER)).unwrap();
+        assert_decrypted(&reloaded);
+    }
+}
+
+/// An `/EF` that names no object of the document cannot change how `save_encrypted` encrypts the
+/// object streams it generates, whose numbers come after the document's.
+#[test]
+fn a_dangling_embedded_file_reference_leaves_object_streams_alone() {
+    let mut doc = Document::load_mem_with_options(&eff_document(), LoadOptions::with_password(USER)).unwrap();
+    let state = doc.encryption_state.take().unwrap();
+    let spec = doc.add_object(dictionary! { "Type" => "Filespec", "F" => Object::string_literal("missing.txt") });
+    // /Encrypt takes the number after max_id, and the generated object streams the ones after it.
+    let generated = |offset: u32| Object::Reference((doc.max_id + offset, 0));
+    let ef = dictionary! { "F" => generated(2), "UF" => generated(3) };
+    doc.get_dictionary_mut(spec).unwrap().set("EF", ef);
+    let options = lopdf::SaveOptions::builder().use_object_streams(true).build();
+    let mut bytes = Vec::new();
+    doc.save_encrypted(&mut bytes, &state, options).unwrap();
+    let reloaded = Document::load_mem_with_options(&bytes, LoadOptions::with_password(USER)).unwrap();
+    assert!(reloaded.catalog().is_ok());
+    assert_decrypted(&reloaded);
+}
+
 /// A file specification in a stream's dictionary names an embedded file too, both when the file
 /// is encrypted and when it is loaded again.
 #[test]
