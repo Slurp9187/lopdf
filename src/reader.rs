@@ -27,7 +27,7 @@ use crate::linearization::Linearization;
 use crate::load_options::{FilterFunc, LoadOptions};
 use crate::object_stream::ObjectStream;
 use crate::parser;
-use crate::xref::{Xref, XrefEntry, XrefRecovery, XrefType, decode_xref_stream_with_limit};
+use crate::xref::{Xref, XrefEntry, XrefRecovery, XrefType};
 use crate::{Dictionary, Document, Error, IncrementalDocument, Object, ObjectId, Result};
 
 /// Open `path` and report its size, so the caller can pre-size the buffer it
@@ -852,8 +852,10 @@ impl<'a> Reader<'a> {
     /// resolve only if the scan finds no usable trailer.
     fn load_xref_and_trailer(&mut self) -> Result<(Xref, Dictionary)> {
         if self.force_reconstruct
-            && let Some(reconstructed) = self.reconstruct_xref_and_trailer()
+            && let Some(reconstructed) = self.reconstruct_xref_and_trailer()?
         {
+            // The rebuilt table is held to the same entry limit as one read as written.
+            self.check_xref_entries(&reconstructed.0)?;
             warn!("rebuilt the cross-reference table by scanning for indirect objects, as requested");
             return Ok(reconstructed);
         }
@@ -863,8 +865,9 @@ impl<'a> Reader<'a> {
             Err(err) if self.force_reconstruct => Err(err),
             // A resource limit, not damage: rebuilding by scanning would not honour it.
             Err(err @ Error::Xref(XrefError::TooManyEntries { .. })) => Err(err),
-            Err(err) => match self.reconstruct_xref_and_trailer() {
+            Err(err) => match self.reconstruct_xref_and_trailer()? {
                 Some(reconstructed) => {
+                    self.check_xref_entries(&reconstructed.0)?;
                     warn!("cross-reference resolution failed ({err}); recovered by scanning for indirect objects");
                     Ok(reconstructed)
                 }
@@ -1046,6 +1049,11 @@ impl<'a> Reader<'a> {
                 }
             }
 
+            // A file specification can also sit in a stream's dictionary, as `Document::encrypt`
+            // finds it there.
+            for (_, _, obj) in &streams {
+                embedded_files.extend(encryption::embedded_file_ids([obj]));
+            }
             for (obj_id, id, mut obj) in streams {
                 if embedded_files.contains(&obj_id) {
                     encryption::decrypt_embedded_file(state, obj_id, &mut obj)?;
@@ -1669,16 +1677,16 @@ impl<'a> Reader<'a> {
     /// Last-resort recovery: rebuild the cross-reference table by scanning the
     /// raw bytes for indirect-object headers and locating a trailer with a
     /// usable `/Root`. Returns `None` (caller keeps the original error) when
-    /// strict mode forbids recovery or nothing usable was found.
-    fn reconstruct_xref_and_trailer(&mut self) -> Option<(Xref, Dictionary)> {
-        if self.strict {
-            return None;
+    /// strict mode forbids recovery or nothing usable was found, and the
+    /// decompression limit a cross-reference stream it found ran into.
+    fn reconstruct_xref_and_trailer(&mut self) -> Result<Option<(Xref, Dictionary)>> {
+        if self.strict || u32::try_from(self.buffer.len()).is_err() {
+            return Ok(None);
         }
-        u32::try_from(self.buffer.len()).ok()?;
 
         let markers = Self::scan_object_markers(self.buffer);
         if markers.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let mut xref = Xref::new(markers.len() as u32, XrefType::CrossReferenceTable);
@@ -1695,13 +1703,17 @@ impl<'a> Reader<'a> {
             // Files written with cross-reference streams only have no `trailer` keyword, and a
             // file cut off before its last cross-reference section may have neither.
             None => {
-                let mut over_limit = false;
-                match self.find_latest_xref_stream(&markers, &mut xref, &mut over_limit) {
-                    Some(trailer) => trailer,
+                let mut over_limit = None;
+                let found = self.find_latest_xref_stream(&markers, &mut xref, &mut over_limit);
+                match (found, over_limit) {
+                    (Some(trailer), _) => trailer,
                     // A cross-reference stream that the decompression limit kept from decoding
                     // is there; the load fails with the limit rather than go on without it.
-                    None if over_limit => return None,
-                    None => self.find_latest_catalog(&markers, &xref)?,
+                    (None, Some(limit)) => return Err(limit),
+                    (None, None) => match self.find_latest_catalog(&markers, &xref) {
+                        Some(trailer) => trailer,
+                        None => return Ok(None),
+                    },
                 }
             }
         };
@@ -1718,7 +1730,7 @@ impl<'a> Reader<'a> {
             "reconstructed cross-reference table with {} objects by scanning for indirect objects",
             xref.entries.len()
         );
-        Some((xref, trailer))
+        Ok(Some((xref, trailer)))
     }
 
     /// Collect `(offset, id)` of every indirect-object header in one pass.
@@ -1944,9 +1956,10 @@ impl<'a> Reader<'a> {
     /// find, so the compressed entries of these streams are added for object
     /// numbers the scan did not see, newer streams first, as resolution merges
     /// `/Prev` sections.
-    /// `over_limit` is set when a stream does not decode within the decompression limit.
+    /// `over_limit` holds the limit error when a stream does not decode within the decompression
+    /// limit, or within what is left of the total.
     fn find_latest_xref_stream(
-        &self, markers: &[(u32, ObjectId)], xref: &mut Xref, over_limit: &mut bool,
+        &self, markers: &[(u32, ObjectId)], xref: &mut Xref, over_limit: &mut Option<Error>,
     ) -> Option<Dictionary> {
         let mut dictionaries = Vec::new();
         let mut compressed = BTreeMap::new();
@@ -1981,10 +1994,15 @@ impl<'a> Reader<'a> {
             if !stream.dict.has_type(b"XRef") {
                 continue;
             }
-            let (stream_xref, dictionary) = match decode_xref_stream_with_limit(stream, self.max_decompressed_size) {
+            // Counted toward the total like the streams resolution decodes.
+            let limit = self.stream_limit();
+            let decoded = crate::parser_aux::decode_xref_stream_counted(stream, limit, |decoded| {
+                self.charge_decompressed(decoded)
+            });
+            let (stream_xref, dictionary) = match decoded {
                 Ok(decoded) => decoded,
-                Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
-                    *over_limit = true;
+                Err(e @ Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+                    over_limit.get_or_insert(self.total_limit_error(limit, e));
                     continue;
                 }
                 Err(_) => continue,
@@ -2288,6 +2306,49 @@ fn shared_offset_document(rows: usize) -> Vec<u8> {
         .bytes(),
     );
     out
+}
+
+/// `objects` numbered objects after the catalog and the page tree, and a `startxref` that points
+/// at nothing, so a load can only rebuild the table by scanning.
+#[cfg(test)]
+fn document_needing_a_scan(objects: usize) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    out.extend(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    out.extend(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    for number in 3..objects + 3 {
+        out.extend(format!("{number} 0 obj\nnull\nendobj\n").bytes());
+    }
+    out.extend(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n9\n%%EOF\n",
+            objects + 3
+        )
+        .bytes(),
+    );
+    out
+}
+
+#[test]
+fn a_table_rebuilt_by_scanning_is_held_to_the_entry_limit() {
+    let bytes = document_needing_a_scan(1000);
+    for force_reconstruct in [false, true] {
+        let options = |max_xref_entries| LoadOptions {
+            max_xref_entries,
+            force_reconstruct,
+            ..Default::default()
+        };
+        let refused = Document::load_mem_with_options(&bytes, options(Some(500)));
+        assert!(
+            matches!(refused, Err(Error::Xref(XrefError::TooManyEntries { limit: 500 }))),
+            "{force_reconstruct}: {refused:?}"
+        );
+        let doc = Document::load_mem_with_options(&bytes, options(Some(5000))).unwrap();
+        assert_eq!(
+            doc.xref_recovery,
+            Some(XrefRecovery::Reconstructed),
+            "{force_reconstruct}"
+        );
+    }
 }
 
 #[test]
