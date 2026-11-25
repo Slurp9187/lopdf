@@ -401,12 +401,14 @@ impl IncrementalDocument {
         // saves do not double-encrypt. An embedded file, which a file specification in either
         // revision names, is encrypted with /EFF, as a reader decrypts it.
         let embedded_files = encryption_state.as_ref().map(|_| {
-            encryption::embedded_file_ids(
-                self.new_document
-                    .objects
-                    .values()
-                    .chain(self.get_prev_documents().objects.values()),
-            )
+            let (new, prev) = (&self.new_document.objects, &self.get_prev_documents().objects);
+            let mut ids = encryption::embedded_file_ids(new.values().chain(prev.values()));
+            encryption::resolve_indirect_ef_dictionaries(&mut ids, |id| {
+                new.get(id)
+                    .or_else(|| prev.get(id))
+                    .and_then(|object| object.as_dict().ok())
+            });
+            ids
         });
         for (&(id, generation), object) in &self.new_document.objects {
             // `Self` is an `IncrementalDocument` here; the helper belongs to `Document`.

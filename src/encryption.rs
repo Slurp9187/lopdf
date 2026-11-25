@@ -1071,12 +1071,19 @@ pub fn decrypt_embedded_file(
 /// The embedded file streams that file specifications among `objects` name in their `/EF`, which
 /// must be decrypted with `/EFF`. References are never encrypted, so this works on encrypted
 /// objects too.
+///
+/// An `/EF` that is a reference gives the id of its dictionary, which
+/// [`resolve_indirect_ef_dictionaries`] replaces with the files it names.
 pub(crate) fn embedded_file_ids<'a>(
     objects: impl IntoIterator<Item = &'a Object>,
 ) -> std::collections::HashSet<ObjectId> {
     fn walk_dict(dict: &Dictionary, found: &mut std::collections::HashSet<ObjectId>) {
-        if let Ok(Object::Dictionary(files)) = dict.get(b"EF") {
-            found.extend(files.iter().filter_map(|(_, file)| file.as_reference().ok()));
+        match dict.get(b"EF") {
+            Ok(Object::Dictionary(files)) => found.extend(ef_dictionary_files(files)),
+            Ok(Object::Reference(files)) => {
+                found.insert(*files);
+            }
+            _ => {}
         }
         dict.iter().for_each(|(_, value)| walk(value, found));
     }
@@ -1095,6 +1102,44 @@ pub(crate) fn embedded_file_ids<'a>(
         walk(object, &mut found);
     }
     found
+}
+
+/// The embedded file streams that the file specifications among `objects` name, an `/EF`
+/// dictionary that is an indirect object included.
+pub(crate) fn embedded_file_ids_in(objects: &BTreeMap<ObjectId, Object>) -> std::collections::HashSet<ObjectId> {
+    let mut found = embedded_file_ids(objects.values());
+    resolve_indirect_ef_dictionaries(&mut found, |id| {
+        objects.get(id).and_then(|object| object.as_dict().ok())
+    });
+    found
+}
+
+/// The files an `/EF` dictionary names.
+pub(crate) fn ef_dictionary_files(files: &Dictionary) -> impl Iterator<Item = ObjectId> + '_ {
+    files.iter().filter_map(|(_, file)| file.as_reference().ok())
+}
+
+/// Whether `dict` has only keys of an `/EF` dictionary (ISO 32000-1, Table 44), which a reader
+/// keeps aside to resolve an `/EF` that refers to it.
+pub(crate) fn has_ef_dictionary_keys(dict: &Dictionary) -> bool {
+    !dict.is_empty()
+        && dict
+            .iter()
+            .all(|(key, _)| matches!(key.as_slice(), b"F" | b"UF" | b"DOS" | b"Mac" | b"Unix"))
+}
+
+/// Replaces each id in `ids` that `dictionary` finds, an `/EF` dictionary that is an indirect
+/// object, with the files it names. Such an id is never an embedded file itself.
+pub(crate) fn resolve_indirect_ef_dictionaries<'a>(
+    ids: &mut std::collections::HashSet<ObjectId>, dictionary: impl Fn(&ObjectId) -> Option<&'a Dictionary>,
+) {
+    let dictionaries: Vec<ObjectId> = ids.iter().filter(|id| dictionary(id).is_some()).copied().collect();
+    for id in dictionaries {
+        ids.remove(&id);
+        if let Some(files) = dictionary(&id) {
+            ids.extend(ef_dictionary_files(files));
+        }
+    }
 }
 
 #[cfg(test)]
