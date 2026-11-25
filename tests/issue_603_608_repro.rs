@@ -261,23 +261,26 @@ fn failing_entry_does_not_abandon_the_rest() {
     assert_eq!(dict.get(b"Reason").unwrap().as_str().unwrap(), b"Testing");
 }
 
-/// #608 at document level: a failing object must not leave the later ones encrypted.
+/// #608 at document level. Upstream decrypts the later objects and drops `/Encrypt`; this fork
+/// leaves the whole document as it was, still encrypted, so that the objects that did not
+/// decrypt are never saved as if they were plain.
 #[test]
-fn undecryptable_object_does_not_abort_document_decryption() {
+fn undecryptable_object_leaves_the_document_encrypted() {
     let mut doc = minimal_document();
     let broken = doc.add_object(Object::string_literal("broken"));
-    let intact = doc.add_object(Object::string_literal("intact"));
+    doc.add_object(Object::string_literal("intact"));
 
     let state = encryption_state(Cipher::Aes128, &doc);
     doc.encrypt(&state).unwrap();
 
     // Ciphertext that is not a whole number of AES blocks can never be decrypted.
     *doc.get_object_mut(broken).unwrap().as_str_mut().unwrap() = vec![0x30; 37];
+    let before = doc.objects.clone();
 
     assert!(doc.decrypt("user").is_err(), "the failure must be reported");
-    assert_eq!(
-        doc.get_object(intact).unwrap().as_str().unwrap(),
-        b"intact",
-        "the object after the failing one was left encrypted"
+    assert!(
+        doc.is_encrypted(),
+        "/Encrypt was dropped from a document that did not decrypt"
     );
+    assert_eq!(doc.objects, before, "the document was left half decrypted");
 }

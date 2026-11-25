@@ -30,6 +30,12 @@ fn eff_document() -> Vec<u8> {
 
 /// [`eff_document`], encrypted in memory and not yet saved.
 fn encrypted_eff_document() -> Document {
+    encrypted_eff_document_with(false)
+}
+
+/// [`encrypted_eff_document`], with the first attachment's `/EF` dictionary an indirect object
+/// when `indirect_ef`.
+fn encrypted_eff_document_with(indirect_ef: bool) -> Document {
     let mut doc = Document::with_version("1.6");
     doc.trailer.set(
         "ID",
@@ -48,11 +54,16 @@ fn encrypted_eff_document() -> Document {
     let content = doc.add_object(Stream::new(dictionary! {}, CONTENT.to_vec()));
     assert_eq!([attachment, typed, own_filter, content], IDS);
 
+    let indirect = indirect_ef.then(|| doc.add_object(dictionary! { "F" => attachment }));
     let file_spec = |name: &str, file: ObjectId| {
+        let files = match indirect {
+            Some(files) if file == attachment => Object::Reference(files),
+            _ => Object::Dictionary(dictionary! { "F" => file }),
+        };
         Object::Dictionary(dictionary! {
             "Type" => "Filespec",
             "F" => Object::string_literal(name),
-            "EF" => dictionary! { "F" => file },
+            "EF" => files,
         })
     };
     let catalog_id = doc.add_object(dictionary! {
@@ -156,10 +167,11 @@ fn decrypting_a_document_uses_the_embedded_file_filter_too() {
     assert_decrypted(&doc);
 }
 
-/// A stream that fails to decrypt is reported once the rest of the document is decrypted, as
-/// any other object is: the document is never left half decrypted.
+/// A stream that fails to decrypt fails `decrypt`, and leaves the document as it was, still
+/// encrypted: without its `/Encrypt`, the streams that did not decrypt would save as plain.
+/// Measured before the fix: `/Encrypt` was gone and the other streams were decrypted.
 #[test]
-fn a_stream_that_fails_to_decrypt_does_not_stop_the_rest() {
+fn a_stream_that_fails_to_decrypt_leaves_the_document_encrypted() {
     let mut doc = encrypted_eff_document();
     // AES needs whole 16-byte blocks after the IV; five bytes cannot decrypt.
     doc.get_object_mut(IDS[0])
@@ -167,13 +179,26 @@ fn a_stream_that_fails_to_decrypt_does_not_stop_the_rest() {
         .as_stream_mut()
         .unwrap()
         .set_content(b"short".to_vec());
+    let before = doc.objects.clone();
     assert!(doc.decrypt(USER).is_err());
-    assert!(!doc.is_encrypted());
-    assert!(doc.encryption_state.is_some());
-    for (id, plaintext) in IDS[1..].iter().zip([TYPED, OWN_FILTER, CONTENT]) {
-        let stream = doc.get_object(*id).unwrap().as_stream().unwrap();
-        assert_eq!(stream.content, plaintext, "{id:?}");
-    }
+    assert!(doc.is_encrypted());
+    assert!(doc.encryption_state.is_none());
+    assert_eq!(doc.objects, before);
+}
+
+/// An `/EF` dictionary that is an indirect object names embedded files too, when a document is
+/// loaded and when it is decrypted. Measured before the fix: the attachment was decrypted with
+/// the stream filter and came out as garbage, with no error.
+#[test]
+fn an_indirect_ef_dictionary_names_an_embedded_file() {
+    let mut bytes = Vec::new();
+    encrypted_eff_document_with(true).save_to(&mut bytes).unwrap();
+    let doc = Document::load_mem_with_options(&bytes, LoadOptions::with_password(USER)).unwrap();
+    assert_decrypted(&doc);
+
+    let mut doc = encrypted_eff_document_with(true);
+    doc.decrypt(USER).unwrap();
+    assert_decrypted(&doc);
 }
 
 /// Encrypting again with the state a load recorded keeps `/EFF`, and encrypts with it every
