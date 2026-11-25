@@ -929,6 +929,9 @@ impl<'a> Reader<'a> {
             // holding a second copy of every object until loading ends.
             let raw_objects = std::mem::take(&mut self.raw_objects);
             let mut streams = Vec::new();
+            // Taken from the objects before the load filter sees them, so that a filter cannot
+            // change which crypt filter decrypts a stream.
+            let mut embedded_files = std::collections::HashSet::new();
             for (obj_id, raw_bytes) in raw_objects {
                 if let Some(enc_ref) = encrypt_ref
                     && obj_id == enc_ref
@@ -948,6 +951,7 @@ impl<'a> Reader<'a> {
                     if let Err(error) = encryption::decrypt_object(state, obj_id, &mut obj) {
                         log::warn!("object {obj_id:?} could not be fully decrypted: {error}");
                     }
+                    embedded_files.extend(encryption::embedded_file_ids([&obj]));
 
                     // Apply the load filter to the decrypted object, as `load_objects_raw` does.
                     if let Some(filter_func) = filter_func
@@ -978,6 +982,7 @@ impl<'a> Reader<'a> {
                             for (obj_num, _index) in objects_in_stream {
                                 let obj_id = (obj_num, 0);
                                 if let Some(obj) = object_stream.objects.get(&obj_id) {
+                                    embedded_files.extend(encryption::embedded_file_ids([obj]));
                                     let mut obj = obj.clone();
                                     if let Some(filter_func) = filter_func {
                                         // Object-stream members keep what the filter returns, as
@@ -1004,7 +1009,6 @@ impl<'a> Reader<'a> {
                 }
             }
 
-            let embedded_files = encryption::embedded_file_ids(self.document.objects.values());
             for (obj_id, id, mut obj) in streams {
                 let result = if embedded_files.contains(&obj_id) {
                     encryption::decrypt_embedded_file(state, obj_id, &mut obj)
