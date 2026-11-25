@@ -111,6 +111,9 @@ pub fn inspect<R: Read + Seek>(input: R, password: Option<&str>) -> Result<Inspe
 pub struct Inspection {
     /// Whether the trailer names an encryption dictionary.
     pub encrypted: bool,
+    /// Which security handler the encryption dictionary names, so a caller can tell a file no
+    /// password opens from a password that is wrong.
+    pub security_handler: SecurityHandler,
     /// What the password given to [`inspect`] is to the file.
     pub password: PasswordCheck,
     /// Whether the file holds a signature a Strip would invalidate.
@@ -121,6 +124,23 @@ pub struct Inspection {
     /// Why the streaming Strip would need the whole-document path, when that is known up front. A
     /// [`strip`] can still find a reason later, in a stream it reads.
     pub needs_whole_document: Option<StripFallback>,
+}
+
+/// Which security handler an encrypted file's encryption dictionary names, from [`inspect`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SecurityHandler {
+    /// The trailer names no encryption dictionary.
+    NotEncrypted,
+    /// `/Filter /Standard`, with a dictionary the password check can read: a password opens it.
+    Standard,
+    /// `/Filter /Standard`, but the password check cannot read what the dictionary says (a
+    /// revision or key length it does not implement), so no password opens it here.
+    StandardUnreadable,
+    /// `/Filter /Adobe.PubSec`: opened by a certificate, not a password.
+    PublicKey,
+    /// Any other filter, none, or an encryption dictionary that could not be read in place.
+    Other,
 }
 
 /// What a password is to a file, from [`inspect`].

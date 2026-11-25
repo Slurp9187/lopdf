@@ -1,7 +1,7 @@
 //! `strip::inspect`: what a file is before a Strip, or for keeping it encrypted as it is.
 
 use lopdf::encryption::crypt_filters::{Aes256CryptFilter, CryptFilter};
-use lopdf::strip::{PasswordCheck, Signed, StripFallback, UsageRights, inspect};
+use lopdf::strip::{PasswordCheck, SecurityHandler, Signed, StripFallback, UsageRights, inspect};
 use lopdf::{Dictionary, Document, EncryptionState, EncryptionVersion, Error, Object, Permissions, dictionary};
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -224,4 +224,52 @@ pub fn append_update_without_encrypt(bytes: &mut Vec<u8>) {
         )
         .as_bytes(),
     );
+}
+
+/// A file whose trailer names `encrypt` as its encryption dictionary. Nothing in it is encrypted:
+/// `inspect` reads only the dictionary to name its handler.
+fn named_encryption(encrypt: Dictionary) -> Vec<u8> {
+    let mut doc = with_fields(vec![]);
+    let id = doc.add_object(encrypt);
+    doc.trailer.set("Encrypt", Object::Reference(id));
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn the_security_handler_is_named() {
+    let standard = std::fs::read("tests/fixtures/crypt/identity-stmf.pdf").unwrap();
+    let found = inspect_bytes(&standard, None).unwrap();
+    assert_eq!(found.security_handler, SecurityHandler::Standard);
+
+    let mut plain = Vec::new();
+    with_fields(vec![]).save_to(&mut plain).unwrap();
+    let found = inspect_bytes(&plain, None).unwrap();
+    assert_eq!(found.security_handler, SecurityHandler::NotEncrypted);
+
+    for (encrypt, handler) in [
+        (
+            dictionary! { "Filter" => "Adobe.PubSec", "V" => 4, "SubFilter" => "adbe.pkcs7.s5" },
+            SecurityHandler::PublicKey,
+        ),
+        // A revision the password check does not implement.
+        (
+            dictionary! { "Filter" => "Standard", "V" => 99, "R" => 99, "O" => Object::string_literal("o"), "U" => Object::string_literal("u"), "P" => -1 },
+            SecurityHandler::StandardUnreadable,
+        ),
+        (
+            dictionary! { "Filter" => "SomeoneElses", "V" => 2 },
+            SecurityHandler::Other,
+        ),
+        (dictionary! { "V" => 2 }, SecurityHandler::Other),
+    ] {
+        let bytes = named_encryption(encrypt);
+        let found = inspect_bytes(&bytes, Some("anything")).unwrap();
+        assert!(found.encrypted, "{handler:?}");
+        assert_eq!(found.security_handler, handler);
+        // A password does not open any of them, which is why the handler is reported: the
+        // check alone cannot tell these from a wrong password.
+        assert_eq!(found.password, PasswordCheck::Wrong, "{handler:?}");
+    }
 }
