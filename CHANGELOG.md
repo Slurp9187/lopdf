@@ -5,6 +5,7 @@
 * Print `***` for the password-derived `/O`, `/U`, `/OE`, `/UE` and `/Perms` values in the `Debug` output of `EncryptionState`, and so of a decrypted `Document`, as upstream already does for the key and the passwords
 * Wipe the password a loader was given, and the sanitized and recovered passwords and intermediate keys derived from it, once they are no longer needed
 * Enable the `zeroize` features of `aes`, `cbc`, `ecb`, `md-5` and `sha2`, which wipe cipher key schedules and hash state
+* Treat `/Identity` and an absent `/StmF`, `/StrF` or stream `/Crypt` name as the Identity crypt filter from V4 on, instead of RC4; find a stream's `/Crypt` parameters in a `/DecodeParms` array; refuse a crypt filter name that is not in `/CF`. `get_stream_filter` and `get_string_filter` now return a `Result`
 
 <a name="v0.45.0"></a>
 ## [v0.45.0](https://github.com/J-F-Liu/lopdf/compare/v0.44.0...v0.45.0) (2026-09-08)
